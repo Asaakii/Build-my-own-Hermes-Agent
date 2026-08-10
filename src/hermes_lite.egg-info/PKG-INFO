@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: hermes-lite
+Version: 0.1.0
+Summary: 用于学习 Hermes Agent 核心机制的受限本地 Agent
+Requires-Python: >=3.12
+Requires-Dist: openai==2.53.0
+Requires-Dist: python-dotenv==1.2.2
+Provides-Extra: dev
+Requires-Dist: pytest==9.1.1; extra == "dev"

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-lite"
+version = "0.1.0"
+description = "用于学习 Hermes Agent 核心机制的受限本地 Agent"
+requires-python = ">=3.12"
+dependencies = [
+    "openai==2.53.0",
+    "python-dotenv==1.2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
