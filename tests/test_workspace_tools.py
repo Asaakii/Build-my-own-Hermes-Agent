@@ -15,6 +15,7 @@ from hermes_lite.workspace_tools import (
     read_file,
     search_text,
     create_text_file,
+    replace_text_once,
 )
 
 
@@ -204,7 +205,7 @@ def test_workspace_tools_run_through_registry(
 
     assert result.is_error is False
     assert "hello.txt" in result.content
-    assert len(registry.list_model_definitions()) == 4
+    assert len(registry.list_model_definitions()) == 5
 
 
 def test_search_text_marks_truncated_paths(
@@ -333,3 +334,138 @@ def test_create_text_file_runs_through_registry(
     assert (workspace.root / "created.txt").read_text(
         encoding="utf-8"
     ) == "注册表创建验证。"
+
+
+def test_replace_text_once_updates_unique_match(
+    workspace: Workspace,
+) -> None:
+    """唯一旧文本应被替换，并返回差异预览。"""
+    target = workspace.root / "note.txt"
+    target.write_text("标题\n旧内容\n结尾", encoding="utf-8")
+
+    result = replace_text_once(
+        workspace,
+        {
+            "path": "note.txt",
+            "expected_text": "旧内容",
+            "replacement": "新内容",
+        },
+    )
+
+    assert target.read_text(encoding="utf-8") == "标题\n新内容\n结尾"
+    assert "已原子替换文本: note.txt" in result
+    assert "-旧内容" in result
+    assert "+新内容" in result
+
+
+def test_replace_text_once_rejects_missing_match(
+    workspace: Workspace,
+) -> None:
+    """旧文本不存在时必须拒绝，原文件保持不变。"""
+    target = workspace.root / "note.txt"
+    target.write_text("原始内容", encoding="utf-8")
+
+    with pytest.raises(ToolExecutionError, match="未找到"):
+        replace_text_once(
+            workspace,
+            {
+                "path": "note.txt",
+                "expected_text": "不存在",
+                "replacement": "新内容",
+            },
+        )
+
+    assert target.read_text(encoding="utf-8") == "原始内容"
+
+
+def test_replace_text_once_rejects_ambiguous_match(
+    workspace: Workspace,
+) -> None:
+    """旧文本出现多次时不能猜测替换位置。"""
+    target = workspace.root / "note.txt"
+    target.write_text("重复 重复", encoding="utf-8")
+
+    with pytest.raises(ToolExecutionError, match="出现多次"):
+        replace_text_once(
+            workspace,
+            {
+                "path": "note.txt",
+                "expected_text": "重复",
+                "replacement": "新内容",
+            },
+        )
+
+    assert target.read_text(encoding="utf-8") == "重复 重复"
+
+
+def test_replace_text_once_rejects_binary_file(
+    workspace: Workspace,
+) -> None:
+    """二进制文件不能进入文本替换流程。"""
+    target = workspace.root / "binary.bin"
+    target.write_bytes(b"hello\x00world")
+
+    with pytest.raises(ToolExecutionError, match="二进制"):
+        replace_text_once(
+            workspace,
+            {
+                "path": "binary.bin",
+                "expected_text": "hello",
+                "replacement": "world",
+            },
+        )
+
+
+def test_replace_text_once_keeps_original_when_replace_fails(
+    workspace: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """原子替换失败时，原文件和临时文件状态应可控。"""
+    target = workspace.root / "note.txt"
+    target.write_text("旧内容", encoding="utf-8")
+
+    def raise_replace_error(source: object, destination: object) -> None:
+        raise OSError("模拟替换失败")
+
+    monkeypatch.setattr(
+        workspace_tools_module.os,
+        "replace",
+        raise_replace_error,
+    )
+
+    with pytest.raises(ToolExecutionError, match="无法原子更新"):
+        replace_text_once(
+            workspace,
+            {
+                "path": "note.txt",
+                "expected_text": "旧内容",
+                "replacement": "新内容",
+            },
+        )
+
+    assert target.read_text(encoding="utf-8") == "旧内容"
+    assert not list(workspace.root.glob(".hermes-lite-*.tmp"))
+
+
+def test_replace_text_once_runs_through_registry(
+    workspace: Workspace,
+) -> None:
+    """精确替换必须通过注册表执行。"""
+    target = workspace.root / "note.txt"
+    target.write_text("旧内容", encoding="utf-8")
+    registry = build_workspace_tool_registry(workspace)
+
+    result = registry.execute(
+        ToolCall(
+            call_id="call-replace",
+            tool_name="replace_text_once",
+            arguments={
+                "path": "note.txt",
+                "expected_text": "旧内容",
+                "replacement": "新内容",
+            },
+        )
+    )
+
+    assert result.is_error is False
+    assert target.read_text(encoding="utf-8") == "新内容"

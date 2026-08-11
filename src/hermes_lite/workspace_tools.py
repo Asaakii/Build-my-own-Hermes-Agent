@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from difflib import unified_diff
+import os
 from os import walk
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from hermes_lite.domain import ToolCall
 from hermes_lite.tool_registry import (
@@ -29,6 +32,9 @@ MAX_QUERY_CHARACTERS = 200
 # 写入限制独立于读取限制，避免一次创建过大内容。
 MAX_WRITE_BYTES = 64 * 1024
 MAX_WRITE_CHARACTERS = 16_000
+# 差异预览也属于工具输出，需要独立限制。
+MAX_DIFF_LINES = 80
+MAX_DIFF_CHARACTERS = 6_000
 
 
 def _require_text_argument(
@@ -85,32 +91,47 @@ def _resolve_new_file_path(workspace: Workspace, raw_path: str) -> Path:
     return path
 
 
-def _require_write_content(arguments: object) -> str:
-    """读取待写入文本，保留原始空白并限制大小。"""
+def _require_write_text_argument(
+    arguments: object,
+    name: str,
+    *,
+    allow_empty: bool,
+) -> str:
+    """读取写入类文本参数，保留空白并限制 UTF-8 大小。"""
     if not isinstance(arguments, dict):
         raise ToolExecutionError("工具参数必须是字典")
 
-    content = arguments.get("content")
+    value = arguments.get(name)
 
-    if not isinstance(content, str):
-        raise ToolExecutionError("content 必须是文本")
+    if not isinstance(value, str):
+        raise ToolExecutionError(f"{name} 必须是文本")
 
-    if "\x00" in content:
-        raise ToolExecutionError("content 不能包含空字节")
+    if not allow_empty and not value:
+        raise ToolExecutionError(f"{name} 不能为空")
 
-    if len(content) > MAX_WRITE_CHARACTERS:
+    if "\x00" in value:
+        raise ToolExecutionError(f"{name} 不能包含空字节")
+
+    if len(value) > MAX_WRITE_CHARACTERS:
         raise ToolExecutionError(
-            f"content 长度不能超过 {MAX_WRITE_CHARACTERS} 个字符"
+            f"{name} 长度不能超过 {MAX_WRITE_CHARACTERS} 个字符"
         )
 
-    encoded_content = content.encode("utf-8")
-
-    if len(encoded_content) > MAX_WRITE_BYTES:
+    if len(value.encode("utf-8")) > MAX_WRITE_BYTES:
         raise ToolExecutionError(
-            f"content 超过写入上限：{MAX_WRITE_BYTES} 字节"
+            f"{name} 超过写入上限：{MAX_WRITE_BYTES} 字节"
         )
 
-    return content
+    return value
+
+
+def _require_write_content(arguments: object) -> str:
+    """读取创建文件时允许为空的文本内容。"""
+    return _require_write_text_argument(
+        arguments,
+        "content",
+        allow_empty=True,
+    )
 
 
 def _display_relative_path(workspace: Workspace, path: Path) -> str:
@@ -260,6 +281,165 @@ def read_file(workspace: Workspace, arguments: object) -> str:
         return f"文件为空: {displayed_path}"
 
     return f"文件: {displayed_path}\n{content}"
+
+
+def _count_text_occurrences(content: str, expected_text: str) -> int:
+    """计算文本中所有（包含重叠情况的）匹配次数。"""
+    count = 0
+    start_index = 0
+
+    while True:
+        found_index = content.find(expected_text, start_index)
+
+        if found_index == -1:
+            return count
+
+        count += 1
+        start_index = found_index + 1
+
+
+def _build_diff_preview(
+    displayed_path: str,
+    original_content: str,
+    updated_content: str,
+) -> str:
+    """生成受行数和字符数限制的统一差异预览。"""
+    preview_lines: list[str] = []
+    character_count = 0
+    truncated = False
+
+    for line in unified_diff(
+        original_content.splitlines(),
+        updated_content.splitlines(),
+        fromfile=displayed_path,
+        tofile=displayed_path,
+        lineterm="",
+    ):
+        if (
+            len(preview_lines) >= MAX_DIFF_LINES
+            or character_count + len(line) > MAX_DIFF_CHARACTERS
+        ):
+            truncated = True
+            break
+
+        preview_lines.append(line)
+        character_count += len(line)
+
+    if not preview_lines:
+        return "（无文本差异）"
+
+    preview = "\n".join(preview_lines)
+
+    if truncated:
+        preview += "\n[差异预览已截断]"
+
+    return preview
+
+
+def _replace_text_atomically(
+    target: Path,
+    original_content: str,
+    updated_content: str,
+) -> None:
+    """先写入同目录临时文件，再原子替换目标文件。"""
+    temporary_path: Path | None = None
+
+    try:
+        with NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=".hermes-lite-",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(updated_content)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+
+        try:
+            current_content = _load_utf8_text(target)
+        except ToolExecutionError as error:
+            raise ToolExecutionError(
+                "目标文件在写入期间发生变化"
+            ) from error
+
+        if current_content != original_content:
+            raise ToolExecutionError("目标文件在写入期间发生变化")
+
+        # 临时文件与目标在同一目录，replace 可避免半写入状态。
+        os.replace(temporary_path, target)
+        temporary_path = None
+    except ToolExecutionError:
+        raise
+    except OSError as error:
+        raise ToolExecutionError("无法原子更新目标文件") from error
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+
+def replace_text_once(workspace: Workspace, arguments: object) -> str:
+    """在 UTF-8 文本文件中精确替换唯一出现的一段文本。"""
+    raw_path = _require_text_argument(
+        arguments,
+        "path",
+        MAX_PATH_CHARACTERS,
+    )
+    expected_text = _require_write_text_argument(
+        arguments,
+        "expected_text",
+        allow_empty=False,
+    )
+    replacement = _require_write_text_argument(
+        arguments,
+        "replacement",
+        allow_empty=True,
+    )
+
+    if expected_text == replacement:
+        raise ToolExecutionError("replacement 不能与 expected_text 相同")
+
+    target = _resolve_existing_path(workspace, raw_path)
+    original_content = _load_utf8_text(target)
+    occurrence_count = _count_text_occurrences(
+        original_content,
+        expected_text,
+    )
+
+    if occurrence_count == 0:
+        raise ToolExecutionError("未找到需要替换的目标文本")
+
+    if occurrence_count > 1:
+        raise ToolExecutionError("目标文本出现多次，拒绝不明确替换")
+
+    updated_content = original_content.replace(
+        expected_text,
+        replacement,
+        1,
+    )
+    displayed_path = _display_relative_path(workspace, target)
+    diff_preview = _build_diff_preview(
+        displayed_path,
+        original_content,
+        updated_content,
+    )
+
+    _replace_text_atomically(
+        target,
+        original_content,
+        updated_content,
+    )
+
+    return (
+        f"已原子替换文本: {displayed_path}\n"
+        "匹配次数: 1\n"
+        f"差异预览:\n{diff_preview}"
+    )
 
 
 def search_text(workspace: Workspace, arguments: object) -> str:
@@ -435,6 +615,10 @@ def build_workspace_tool_registry(workspace: Workspace) -> ToolRegistry:
         """调用创建文本文件工具。"""
         return create_text_file(workspace, arguments)
 
+    def replace_text_once_handler(arguments: dict[str, object]) -> str:
+        """调用精确文本替换工具。"""
+        return replace_text_once(workspace, arguments)
+
     registry.register(
         ToolDefinition(
             name="list_files",
@@ -517,6 +701,40 @@ def build_workspace_tool_registry(workspace: Workspace) -> ToolRegistry:
             },
             risk_level=ToolRiskLevel.WRITE,
             handler=create_text_file_handler,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="replace_text_once",
+            description=(
+                "在受限工作区的 UTF-8 文本文件中，"
+                "精确替换唯一出现的一段文本。"
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "工作区内相对文件路径。",
+                    },
+                    "expected_text": {
+                        "type": "string",
+                        "description": "原文件中必须恰好出现一次的旧文本。",
+                    },
+                    "replacement": {
+                        "type": "string",
+                        "description": "替换后的新文本；允许为空以删除旧文本。",
+                    },
+                },
+                "required": [
+                    "path",
+                    "expected_text",
+                    "replacement",
+                ],
+                "additionalProperties": False,
+            },
+            risk_level=ToolRiskLevel.WRITE,
+            handler=replace_text_once_handler,
         )
     )
     return registry
