@@ -2,9 +2,8 @@
 __pycache__/
 .pytest_cache/
 *.py[cod]
-
 .env
 实际指导过程复盘.md
-
 data/
 logs/
+sandbox_workspace/
