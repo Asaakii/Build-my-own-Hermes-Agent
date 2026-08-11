@@ -22,7 +22,7 @@ def _require_text(value: object, field_name: str) -> str:
 
     return cleaned_value
 
-def _require_tool_name(value: object) -> str:
+def require_tool_name(value: object) -> str:
     """验证工具名称不会携带路径或特殊字符。"""
     tool_name = _require_text(value, "tool_name")
 
@@ -75,7 +75,8 @@ class ToolCall:
 
     def __post_init__(self) -> None:
         """验证工具标识、名称格式和参数容器。"""
-        object.__setattr__(self, "tool_name", _require_tool_name(self.tool_name))
+        object.__setattr__(self, "call_id", _require_text(self.call_id, "call_id"))
+        object.__setattr__(self, "tool_name", require_tool_name(self.tool_name))
 
         if not isinstance(self.arguments, dict):
             raise ValueError("arguments 必须是字典")
@@ -93,7 +94,7 @@ class ToolResult:
     def __post_init__(self) -> None:
         """验证结果能够对应一次合法工具调用。"""
         object.__setattr__(self, "call_id", _require_text(self.call_id, "call_id"))
-        object.__setattr__(self, "tool_name", _require_tool_name(self.tool_name))
+        object.__setattr__(self, "tool_name", require_tool_name(self.tool_name))
         object.__setattr__(self, "content", _require_text(self.content, "content"))
 
         if not isinstance(self.is_error, bool):

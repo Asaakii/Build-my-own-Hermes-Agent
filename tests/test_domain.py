@@ -89,3 +89,13 @@ def test_task_state_rejects_invalid_tool_rounds(tool_rounds: object) -> None:
             user_request="读取文件",
             tool_rounds=tool_rounds,  # type: ignore[arg-type]
         )
+
+
+def test_tool_call_rejects_empty_call_id() -> None:
+    """工具调用必须拥有可关联结果的标识。"""
+    with pytest.raises(ValueError):
+        ToolCall(
+            call_id="   ",
+            tool_name="read_file",
+            arguments={},
+        )
