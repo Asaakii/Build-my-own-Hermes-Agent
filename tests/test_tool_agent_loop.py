@@ -216,3 +216,38 @@ def test_tool_agent_rejects_invalid_max_tool_rounds(
             make_registry(),
             max_tool_rounds=max_tool_rounds,  # type: ignore[arg-type]
         )
+
+def test_tool_agent_groups_multiple_calls_in_one_round() -> None:
+    """同一条助手工具请求中的多个调用应归入同一轮摘要。"""
+    model = ScriptedToolModel(
+        responses=[
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=None,
+                tool_calls=(
+                    ToolCall(
+                        call_id="call-1",
+                        tool_name="echo_text",
+                        arguments={"text": "第一项"},
+                    ),
+                    ToolCall(
+                        call_id="call-2",
+                        tool_name="echo_text",
+                        arguments={"text": "第二项"},
+                    ),
+                ),
+            ),
+            Message(role=MessageRole.ASSISTANT, content="同轮调用完成。"),
+        ]
+    )
+    agent = ToolAgent(model, make_registry())
+
+    turn = agent.run_turn(Session(session_id="session-1"), "执行两项调用。")
+
+    assert turn.task.tool_rounds == 1
+    assert len(turn.round_summaries) == 1
+    assert [result.call_id for result in turn.round_summaries[0].results] == [
+        "call-1",
+        "call-2",
+    ]
+    assert turn.tool_results == turn.round_summaries[0].results

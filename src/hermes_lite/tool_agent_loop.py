@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from uuid import uuid4
 
+from hermes_lite.coding_task import ToolRoundSummary
 from hermes_lite.domain import (
     Message,
     MessageRole,
@@ -44,11 +45,30 @@ class ToolAgentTurn:
     answer: str | None
     error_message: str | None
     tool_results: tuple[ToolResult, ...]
+    round_summaries: tuple[ToolRoundSummary, ...]
 
     def __post_init__(self) -> None:
-        """验证成功或失败状态与返回数据一致。"""
+        """验证成功或失败状态与工具结果摘要一致。"""
         if not all(isinstance(result, ToolResult) for result in self.tool_results):
             raise ValueError("tool_results 中的元素必须是 ToolResult")
+
+        if not isinstance(self.round_summaries, tuple):
+            raise ValueError("round_summaries 必须是元组")
+
+        if not all(
+            isinstance(summary, ToolRoundSummary)
+            for summary in self.round_summaries
+        ):
+            raise ValueError("round_summaries 中的元素必须是 ToolRoundSummary")
+
+        summarized_results = tuple(
+            result
+            for summary in self.round_summaries
+            for result in summary.results
+        )
+
+        if summarized_results != self.tool_results:
+            raise ValueError("round_summaries 必须完整保留工具结果顺序")
 
         if self.task.status is TaskStatus.COMPLETED:
             if not isinstance(self.answer, str) or not self.answer:
@@ -98,6 +118,7 @@ class ToolAgent:
         self,
         task: TaskState,
         tool_results: list[ToolResult],
+        round_summaries: list[ToolRoundSummary],
         error_message: str,
     ) -> ToolAgentTurn:
         """把失败状态统一转换为结构化运行结果。"""
@@ -107,6 +128,7 @@ class ToolAgent:
             answer=None,
             error_message=error_message,
             tool_results=tuple(tool_results),
+            round_summaries=tuple(round_summaries),
         )
 
     def run_turn(
@@ -127,6 +149,7 @@ class ToolAgent:
             status=TaskStatus.RUNNING,
         )
         tool_results: list[ToolResult] = []
+        round_summaries: list[ToolRoundSummary] = []
 
         # 用户真实输入先写入会话；之后即使模型失败也不丢失。
         session.messages.append(user_message)
@@ -138,12 +161,18 @@ class ToolAgent:
                     self._registry.list_model_definitions(),
                 )
             except ModelClientError as error:
-                return self._failed_turn(task, tool_results, str(error))
+                return self._failed_turn(
+                    task,
+                    tool_results,
+                    round_summaries,
+                    str(error),
+                )
 
             if not isinstance(response, Message):
                 return self._failed_turn(
                     task,
                     tool_results,
+                    round_summaries,
                     "模型返回了无效的 Agent 消息",
                 )
 
@@ -151,6 +180,7 @@ class ToolAgent:
                 return self._failed_turn(
                     task,
                     tool_results,
+                    round_summaries,
                     "模型返回的 Agent 消息必须是 assistant 角色",
                 )
 
@@ -164,18 +194,29 @@ class ToolAgent:
                     answer=response.content,
                     error_message=None,
                     tool_results=tuple(tool_results),
+                    round_summaries=tuple(round_summaries),
                 )
 
             if task.tool_rounds >= self._max_tool_rounds:
                 return self._failed_turn(
                     task,
                     tool_results,
+                    round_summaries,
                     "工具调用次数超过上限",
                 )
 
             task.tool_rounds += 1
+            current_round_results: list[ToolResult] = []
 
             for call in response.tool_calls:
                 result = self._registry.execute(call)
                 tool_results.append(result)
+                current_round_results.append(result)
                 session.messages.append(Message.from_tool_result(result))
+
+            round_summaries.append(
+                ToolRoundSummary(
+                    round_number=task.tool_rounds,
+                    results=tuple(current_round_results),
+                )
+            )
