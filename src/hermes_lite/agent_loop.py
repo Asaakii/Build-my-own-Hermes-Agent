@@ -14,6 +14,11 @@ from hermes_lite.domain import (
     TaskState,
     TaskStatus,
 )
+from hermes_lite.memory_store import (
+    MemoryStoreError,
+    SQLiteMemoryStore,
+    parse_remember_command,
+)
 from hermes_lite.model_client import ModelClientError
 from hermes_lite.prompt_builder import (
     HistorySummarizer,
@@ -73,6 +78,7 @@ class TextAgent:
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         prompt_builder: PromptBuilder | None = None,
         history_summarizer: HistorySummarizer | None = None,
+        memory_store: SQLiteMemoryStore | None = None,
     ) -> None:
         """保存模型与可替换的上下文构建依赖。"""
         if prompt_builder is not None and not isinstance(
@@ -81,6 +87,12 @@ class TextAgent:
         ):
             raise ValueError("prompt_builder 必须是 PromptBuilder 或 None")
 
+        if memory_store is not None and not isinstance(
+            memory_store,
+            SQLiteMemoryStore,
+        ):
+            raise ValueError("memory_store 必须是 SQLiteMemoryStore 或 None")
+
         self._model = model
         self._system_message = Message(
             role=MessageRole.SYSTEM,
@@ -88,12 +100,24 @@ class TextAgent:
         )
         self._prompt_builder = prompt_builder or PromptBuilder()
         self._history_summarizer = history_summarizer
+        self._memory_store = memory_store
+
+    def _long_term_memory_contents(self) -> tuple[str, ...]:
+        """读取少量已授权记忆，供本轮可信上下文注入。"""
+        if self._memory_store is None:
+            return ()
+
+        return tuple(
+            memory.content
+            for memory in self._memory_store.list_memories()
+        )
 
     def _build_model_messages(self, session: Session) -> tuple[Message, ...]:
         """通过统一 Builder 构建本轮可发送给模型的上下文。"""
         return self._prompt_builder.build(
             safety_rules=self._system_message.content,
             workspace_rules=DEFAULT_TEXT_WORKSPACE_RULES,
+            long_term_memories=self._long_term_memory_contents(),
             history=session.messages,
             summarizer=self._history_summarizer,
         ).messages
@@ -120,10 +144,45 @@ class TextAgent:
         session.messages.append(user_message)
 
         try:
+            remember_request = parse_remember_command(
+                session.session_id,
+                user_message.content,
+            )
+        except MemoryStoreError as error:
+            task.status = TaskStatus.FAILED
+            return AgentTurn(task=task, answer=None, error_message=str(error))
+
+        if remember_request is not None:
+            if self._memory_store is None:
+                task.status = TaskStatus.FAILED
+                return AgentTurn(
+                    task=task,
+                    answer=None,
+                    error_message="长期记忆存储尚未配置",
+                )
+
+            try:
+                save_result = self._memory_store.save_authorized(remember_request)
+            except MemoryStoreError as error:
+                task.status = TaskStatus.FAILED
+                return AgentTurn(task=task, answer=None, error_message=str(error))
+
+            answer = (
+                "长期记忆已保存。"
+                if save_result.created
+                else "长期记忆已存在。"
+            )
+            session.messages.append(
+                Message(role=MessageRole.ASSISTANT, content=answer),
+            )
+            task.status = TaskStatus.COMPLETED
+            return AgentTurn(task=task, answer=answer, error_message=None)
+
+        try:
             answer = self._model.ask_messages(
                 self._build_model_messages(session),
             )
-        except (ModelClientError, PromptBuilderError) as error:
+        except (ModelClientError, PromptBuilderError, MemoryStoreError) as error:
             task.status = TaskStatus.FAILED
             return AgentTurn(
                 task=task,

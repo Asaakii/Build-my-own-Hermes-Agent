@@ -16,6 +16,11 @@ from hermes_lite.domain import (
     TaskStatus,
     ToolResult,
 )
+from hermes_lite.memory_store import (
+    MemoryStoreError,
+    SQLiteMemoryStore,
+    parse_remember_command,
+)
 from hermes_lite.model_client import ModelClientError
 from hermes_lite.prompt_builder import (
     HistorySummarizer,
@@ -105,6 +110,7 @@ class ToolAgent:
         system_prompt: str = DEFAULT_TOOL_SYSTEM_PROMPT,
         prompt_builder: PromptBuilder | None = None,
         history_summarizer: HistorySummarizer | None = None,
+        memory_store: SQLiteMemoryStore | None = None,
     ) -> None:
         """保存模型、工具注册表和每次任务允许的最大工具轮数。"""
         if not isinstance(registry, ToolRegistry):
@@ -123,6 +129,12 @@ class ToolAgent:
         ):
             raise ValueError("prompt_builder 必须是 PromptBuilder 或 None")
 
+        if memory_store is not None and not isinstance(
+            memory_store,
+            SQLiteMemoryStore,
+        ):
+            raise ValueError("memory_store 必须是 SQLiteMemoryStore 或 None")
+
         self._model = model
         self._registry = registry
         self._max_tool_rounds = max_tool_rounds
@@ -132,6 +144,17 @@ class ToolAgent:
         )
         self._prompt_builder = prompt_builder or PromptBuilder()
         self._history_summarizer = history_summarizer
+        self._memory_store = memory_store
+
+    def _long_term_memory_contents(self) -> tuple[str, ...]:
+        """读取少量已授权记忆，供本轮可信上下文注入。"""
+        if self._memory_store is None:
+            return ()
+
+        return tuple(
+            memory.content
+            for memory in self._memory_store.list_memories()
+        )
 
     def _build_model_messages(self, session: Session) -> tuple[Message, ...]:
         """构建含工具定义和受限历史的模型上下文。"""
@@ -139,6 +162,7 @@ class ToolAgent:
             safety_rules=self._system_message.content,
             workspace_rules=DEFAULT_TOOL_WORKSPACE_RULES,
             tool_definitions=self._registry.list_model_definitions(),
+            long_term_memories=self._long_term_memory_contents(),
             history=session.messages,
             summarizer=self._history_summarizer,
         ).messages
@@ -183,13 +207,62 @@ class ToolAgent:
         # 用户真实输入先写入会话；之后即使模型失败也不丢失。
         session.messages.append(user_message)
 
+        try:
+            remember_request = parse_remember_command(
+                session.session_id,
+                user_message.content,
+            )
+        except MemoryStoreError as error:
+            return self._failed_turn(
+                task,
+                tool_results,
+                round_summaries,
+                str(error),
+            )
+
+        if remember_request is not None:
+            if self._memory_store is None:
+                return self._failed_turn(
+                    task,
+                    tool_results,
+                    round_summaries,
+                    "长期记忆存储尚未配置",
+                )
+
+            try:
+                save_result = self._memory_store.save_authorized(remember_request)
+            except MemoryStoreError as error:
+                return self._failed_turn(
+                    task,
+                    tool_results,
+                    round_summaries,
+                    str(error),
+                )
+
+            answer = (
+                "长期记忆已保存。"
+                if save_result.created
+                else "长期记忆已存在。"
+            )
+            session.messages.append(
+                Message(role=MessageRole.ASSISTANT, content=answer),
+            )
+            task.status = TaskStatus.COMPLETED
+            return ToolAgentTurn(
+                task=task,
+                answer=answer,
+                error_message=None,
+                tool_results=(),
+                round_summaries=(),
+            )
+
         while True:
             try:
                 response = self._model.respond(
                     self._build_model_messages(session),
                     self._registry.list_model_definitions(),
                 )
-            except (ModelClientError, PromptBuilderError) as error:
+            except (ModelClientError, PromptBuilderError, MemoryStoreError) as error:
                 return self._failed_turn(
                     task,
                     tool_results,

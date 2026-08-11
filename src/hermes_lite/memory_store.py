@@ -214,6 +214,34 @@ class SQLiteMemoryStore:
             created=cursor.rowcount == 1,
         )
 
+    def list_memories(self, max_results: int = 5) -> tuple[LongTermMemory, ...]:
+        """按保存顺序读取有限条已授权记忆，供受限提示词注入。"""
+        if (
+            isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or max_results <= 0
+            or max_results > 20
+        ):
+            raise MemoryStoreError("max_results 必须是 1 到 20 的整数")
+
+        self._state_store.initialize()
+        connection: sqlite3.Connection | None = None
+
+        try:
+            connection = self._connect()
+            rows = connection.execute(
+                "SELECT memory_id, source_session_id, content, created_at "
+                "FROM long_term_memories ORDER BY memory_id LIMIT ?",
+                (max_results,),
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise MemoryStoreError("无法读取长期记忆") from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+        return tuple(self._from_row(row) for row in rows)
+
     def search(self, query: object, max_results: int = 5) -> tuple[LongTermMemory, ...]:
         """按规范化子串检索已授权记忆，未命中时返回空元组。"""
         query_text = _require_text(query, "query")
