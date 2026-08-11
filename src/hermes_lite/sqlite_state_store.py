@@ -66,6 +66,26 @@ class SQLiteStateConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionRestoreResult:
+    """一次会话恢复的结果，包括被跳过的损坏消息数量。"""
+
+    session: Session | None
+    skipped_message_records: int = 0
+
+    def __post_init__(self) -> None:
+        """验证恢复结果不会伪造会话或跳过数量。"""
+        if self.session is not None and not isinstance(self.session, Session):
+            raise SQLiteStateStoreError("session 必须是 Session 或 None")
+
+        if (
+            isinstance(self.skipped_message_records, bool)
+            or not isinstance(self.skipped_message_records, int)
+            or self.skipped_message_records < 0
+        ):
+            raise SQLiteStateStoreError("skipped_message_records 必须是非负整数")
+
+
+@dataclass(frozen=True, slots=True)
 class StoredCodingTask:
     """从 SQLite 恢复的一条任务状态及其可选最终报告。"""
 
@@ -361,8 +381,8 @@ class SQLiteStateStore:
             if connection is not None:
                 connection.close()
 
-    def load_session(self, session_id: object) -> Session | None:
-        """按会话标识恢复完整消息历史，不存在时返回 None。"""
+    def restore_session(self, session_id: object) -> SessionRestoreResult:
+        """恢复会话，并跳过单条无法构造成领域消息的损坏记录。"""
         if not isinstance(session_id, str) or not session_id.strip():
             raise SQLiteStateStoreError("session_id 必须是非空文本")
 
@@ -378,7 +398,7 @@ class SQLiteStateStore:
             ).fetchone()
 
             if exists is None:
-                return None
+                return SessionRestoreResult(session=None)
 
             rows = connection.execute(
                 "SELECT role, content, tool_call_id, tool_calls_json "
@@ -386,24 +406,38 @@ class SQLiteStateStore:
                 "ORDER BY sequence_number",
                 (normalized_session_id,),
             ).fetchall()
-            messages = [
-                Message(
-                    role=MessageRole(row[0]),
-                    content=row[1],
-                    tool_call_id=row[2],
-                    tool_calls=_deserialize_tool_calls(row[3]),
-                )
-                for row in rows
-            ]
-            return Session(
-                session_id=normalized_session_id,
-                messages=messages,
+            messages: list[Message] = []
+            skipped_message_records = 0
+
+            for row in rows:
+                try:
+                    messages.append(
+                        Message(
+                            role=MessageRole(row[0]),
+                            content=row[1],
+                            tool_call_id=row[2],
+                            tool_calls=_deserialize_tool_calls(row[3]),
+                        )
+                    )
+                except (SQLiteStateStoreError, TypeError, ValueError):
+                    skipped_message_records += 1
+
+            return SessionRestoreResult(
+                session=Session(
+                    session_id=normalized_session_id,
+                    messages=messages,
+                ),
+                skipped_message_records=skipped_message_records,
             )
-        except (sqlite3.Error, ValueError) as error:
-            raise SQLiteStateStoreError("会话记录损坏或无法恢复") from error
+        except sqlite3.Error as error:
+            raise SQLiteStateStoreError("会话记录无法恢复") from error
         finally:
             if connection is not None:
                 connection.close()
+
+    def load_session(self, session_id: object) -> Session | None:
+        """按会话标识恢复消息历史，不存在时返回 None。"""
+        return self.restore_session(session_id).session
 
     def save_coding_task(
         self,

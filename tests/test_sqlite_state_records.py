@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -227,3 +228,97 @@ def test_save_session_rejects_non_json_tool_arguments(
 
     with pytest.raises(SQLiteStateStoreError, match="无法序列化"):
         store.save_session(session)
+
+
+def test_restore_session_skips_one_corrupted_message_record(
+    store: SQLiteStateStore,
+) -> None:
+    """单条非法角色记录不应阻断同一会话的其他历史恢复。"""
+    session = make_session()
+    store.save_session(session)
+
+    connection = sqlite3.connect(store.database_path)
+    try:
+        with connection:
+            connection.execute(
+                "UPDATE messages SET role = ? "
+                "WHERE session_id = ? AND sequence_number = ?",
+                ("invalid-role", session.session_id, 1),
+            )
+    finally:
+        connection.close()
+
+    restored = store.restore_session(session.session_id)
+
+    assert restored.session is not None
+    assert restored.skipped_message_records == 1
+    assert [message.role for message in restored.session.messages] == [
+        MessageRole.SYSTEM,
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+    ]
+
+
+def test_restore_session_skips_invalid_tool_call_json(
+    store: SQLiteStateStore,
+) -> None:
+    """单条无法解析的工具调用记录应被跳过并留下明确计数。"""
+    session = make_session()
+    store.save_session(session)
+
+    connection = sqlite3.connect(store.database_path)
+    try:
+        with connection:
+            connection.execute(
+                "UPDATE messages SET tool_calls_json = ? "
+                "WHERE session_id = ? AND sequence_number = ?",
+                ("{invalid-json", session.session_id, 2),
+            )
+    finally:
+        connection.close()
+
+    restored = store.restore_session(session.session_id)
+
+    assert restored.session is not None
+    assert restored.skipped_message_records == 1
+    assert [message.role for message in restored.session.messages] == [
+        MessageRole.SYSTEM,
+        MessageRole.USER,
+        MessageRole.TOOL,
+    ]
+
+
+def test_restore_session_keeps_sessions_isolated(
+    store: SQLiteStateStore,
+) -> None:
+    """不同 session_id 的历史恢复不能混入彼此的数据。"""
+    first = Session(
+        session_id="session-a",
+        messages=[Message(role=MessageRole.USER, content="会话 A 内容")],
+    )
+    second = Session(
+        session_id="session-b",
+        messages=[Message(role=MessageRole.USER, content="会话 B 内容")],
+    )
+    store.save_session(first)
+    store.save_session(second)
+
+    restored_first = store.restore_session(first.session_id)
+    restored_second = store.restore_session(second.session_id)
+
+    assert restored_first.session is not None
+    assert restored_second.session is not None
+    assert restored_first.session.messages[0].content == "会话 A 内容"
+    assert restored_second.session.messages[0].content == "会话 B 内容"
+    assert restored_first.skipped_message_records == 0
+    assert restored_second.skipped_message_records == 0
+
+
+def test_restore_missing_session_has_no_skipped_records(
+    store: SQLiteStateStore,
+) -> None:
+    """不存在的会话不是损坏记录，应返回零跳过计数。"""
+    restored = store.restore_session("missing-session")
+
+    assert restored.session is None
+    assert restored.skipped_message_records == 0
