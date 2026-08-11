@@ -82,19 +82,15 @@ class CodingTaskReport:
         if not all(isinstance(round_, ToolRoundSummary) for round_ in self.rounds):
             raise ValueError("rounds 中的元素必须是 ToolRoundSummary")
 
-        if self.status is TaskStatus.COMPLETED:
-            if self.verification is not VerificationStatus.PASSED:
-                raise ValueError("已完成任务必须通过测试验证")
-            return
+        if self.status not in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.BLOCKED,
+        }:
+            raise ValueError("编码任务报告只能记录最终状态")
 
-        if self.status is TaskStatus.FAILED:
-            if self.verification is not VerificationStatus.FAILED:
-                raise ValueError("失败任务必须包含失败验证")
-            return
-
-        if self.status is TaskStatus.BLOCKED:
-            if self.verification is not VerificationStatus.NOT_RUN:
-                raise ValueError("受阻任务不能伪造测试验证")
-            return
-
-        raise ValueError("编码任务报告只能记录最终状态")
+        if (
+            self.status is TaskStatus.COMPLETED
+            and self.verification is not VerificationStatus.PASSED
+        ):
+            raise ValueError("已完成任务必须通过测试验证")

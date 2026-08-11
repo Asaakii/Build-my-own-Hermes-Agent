@@ -34,26 +34,43 @@ def test_completed_report_requires_passed_verification() -> None:
 
 
 @pytest.mark.parametrize(
-    ("status", "verification"),
-    [
-        (TaskStatus.COMPLETED, VerificationStatus.FAILED),
-        (TaskStatus.FAILED, VerificationStatus.PASSED),
-        (TaskStatus.BLOCKED, VerificationStatus.PASSED),
-    ],
+    "verification",
+    [VerificationStatus.FAILED, VerificationStatus.NOT_RUN],
 )
-def test_report_rejects_inconsistent_final_status(
-    status: TaskStatus,
+def test_completed_report_rejects_non_passed_verification(
     verification: VerificationStatus,
 ) -> None:
-    """最终任务状态不能与测试验证状态矛盾。"""
+    """完成的编码任务不能缺少通过的测试验证。"""
     with pytest.raises(ValueError):
         CodingTaskReport(
             task_id="coding-task-1",
-            status=status,
+            status=TaskStatus.COMPLETED,
             verification=verification,
             summary="状态不一致。",
             rounds=(),
         )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [TaskStatus.FAILED, TaskStatus.BLOCKED],
+)
+@pytest.mark.parametrize("verification", list(VerificationStatus))
+def test_non_completed_report_keeps_actual_verification(
+    status: TaskStatus,
+    verification: VerificationStatus,
+) -> None:
+    """未完成任务保留真实验证结果，不强行改写。"""
+    report = CodingTaskReport(
+        task_id="coding-task-1",
+        status=status,
+        verification=verification,
+        summary="任务未完成。",
+        rounds=(),
+    )
+
+    assert report.status is status
+    assert report.verification is verification
 
 
 @pytest.mark.parametrize("status", [TaskStatus.PENDING, TaskStatus.RUNNING])
