@@ -16,6 +16,7 @@ from hermes_lite.model_client import (
     ModelTimeoutError,
 )
 import hermes_lite.model_client as model_client_module
+from hermes_lite.domain import Message, MessageRole, ToolCall
 
 def make_config() -> ModelConfig:
     """构造不含真实密钥的测试配置。"""
@@ -214,11 +215,38 @@ def test_ask_messages_rejects_tool_message_before_tool_support() -> None:
     """工具消息在未实现 tool_call_id 前必须明确拒绝。"""
     client = ModelClient(make_config(), client=FakeOpenAIClient())
     messages = [
-        Message(role=MessageRole.TOOL, content="工具结果"),
+        Message(
+            role=MessageRole.TOOL,
+            content="工具结果",
+            tool_call_id="call-1",
+        ),
     ]
 
     with pytest.raises(ValueError, match="暂不支持工具消息"):
         client.ask_messages(messages)
+
+
+def test_ask_messages_rejects_assistant_tool_request_before_tool_support() -> None:
+    """纯文本客户端不能提前发送助手工具请求。"""
+    fake_client = FakeOpenAIClient()
+    client = ModelClient(make_config(), client=fake_client)
+    call = ToolCall(
+        call_id="call-1",
+        tool_name="summarize_text",
+        arguments={"text": "测试"},
+    )
+    messages = [
+        Message(
+            role=MessageRole.ASSISTANT,
+            content=None,
+            tool_calls=(call,),
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="暂不支持工具消息"):
+        client.ask_messages(messages)
+
+    assert fake_client.completions.requests == []
 
 
 class FakeRuntimeClient:

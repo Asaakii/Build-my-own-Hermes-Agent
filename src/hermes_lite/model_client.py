@@ -72,8 +72,13 @@ class ModelClient:
         if not all(isinstance(message, Message) for message in message_list):
             raise ValueError("messages 中的元素必须是 Message")
 
-        # 当前阶段尚未实现 tool_call_id，因此不能伪造 OpenAI 工具消息。
-        if any(message.role is MessageRole.TOOL for message in message_list):
+        # 当前纯文本客户端尚未实现结构化工具调用协议。
+        if any(
+            message.role is MessageRole.TOOL
+            or message.tool_calls
+            or message.tool_call_id is not None
+            for message in message_list
+        ):
             raise ValueError("当前文本客户端暂不支持工具消息")
 
         request_messages = [

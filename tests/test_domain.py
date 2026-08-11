@@ -99,3 +99,107 @@ def test_tool_call_rejects_empty_call_id() -> None:
             tool_name="read_file",
             arguments={},
         )
+
+
+def test_assistant_tool_request_keeps_structured_calls() -> None:
+    """助手请求工具时不使用伪造的文本内容。"""
+    call = ToolCall(
+        call_id="call-1",
+        tool_name="summarize_text",
+        arguments={"text": "测试"},
+    )
+
+    message = Message(
+        role=MessageRole.ASSISTANT,
+        content=None,
+        tool_calls=(call,),
+    )
+
+    assert message.content is None
+    assert message.tool_calls == (call,)
+
+
+def test_assistant_tool_request_rejects_text_content() -> None:
+    """工具请求和普通文本回答不能混为同一种消息。"""
+    call = ToolCall(
+        call_id="call-1",
+        tool_name="summarize_text",
+        arguments={"text": "测试"},
+    )
+
+    with pytest.raises(ValueError, match="助手工具请求不能包含文本内容"):
+        Message(
+            role=MessageRole.ASSISTANT,
+            content="同时回答并调用工具",
+            tool_calls=(call,),
+        )
+
+
+def test_assistant_rejects_non_tuple_tool_calls() -> None:
+    """工具调用集合使用元组，避免会话消息创建后被修改。"""
+    call = ToolCall(
+        call_id="call-1",
+        tool_name="summarize_text",
+        arguments={"text": "测试"},
+    )
+
+    with pytest.raises(ValueError, match="tool_calls 必须是元组"):
+        Message(
+            role=MessageRole.ASSISTANT,
+            content=None,
+            tool_calls=[call],  # type: ignore[arg-type]
+        )
+
+
+def test_assistant_text_message_still_requires_content() -> None:
+    """未请求工具的助手消息仍必须提供非空文本。"""
+    with pytest.raises(ValueError, match="content 必须是文本"):
+        Message(role=MessageRole.ASSISTANT, content=None)
+
+
+def test_tool_message_requires_call_id() -> None:
+    """工具结果必须能对应到此前的某一次工具调用。"""
+    with pytest.raises(ValueError, match="tool_call_id 必须是文本"):
+        Message(role=MessageRole.TOOL, content="工具结果")
+
+
+def test_user_message_rejects_tool_call_id() -> None:
+    """用户消息不能伪装为工具结果。"""
+    with pytest.raises(ValueError, match="不能包含 tool_call_id"):
+        Message(
+            role=MessageRole.USER,
+            content="用户问题",
+            tool_call_id="call-1",
+        )
+
+
+def test_tool_message_rejects_tool_calls() -> None:
+    """工具结果消息不能继续携带新的工具请求。"""
+    call = ToolCall(
+        call_id="call-2",
+        tool_name="summarize_text",
+        arguments={"text": "测试"},
+    )
+
+    with pytest.raises(ValueError, match="不能包含工具调用"):
+        Message(
+            role=MessageRole.TOOL,
+            content="工具结果",
+            tool_call_id="call-1",
+            tool_calls=(call,),
+        )
+
+
+def test_message_from_tool_result_creates_structured_tool_message() -> None:
+    """受控工具结果应以调用标识写回会话。"""
+    result = ToolResult(
+        call_id="call-1",
+        tool_name="summarize_text",
+        content="摘要完成",
+    )
+
+    message = Message.from_tool_result(result)
+
+    assert message.role is MessageRole.TOOL
+    assert message.content == "摘要完成"
+    assert message.tool_call_id == "call-1"

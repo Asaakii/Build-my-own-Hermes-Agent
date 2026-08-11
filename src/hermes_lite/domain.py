@@ -3,6 +3,8 @@
 这些模型只描述“系统中有什么数据”，暂不处理模型调用、工具执行或数据库存储。
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 import re
@@ -52,17 +54,79 @@ class TaskStatus(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class Message:
-    """一条会话消息。"""
+    """一条会话消息，支持文本、工具请求与工具结果。"""
 
     role: MessageRole
-    content: str
+    content: str | None = None
+    tool_calls: tuple[ToolCall, ...] = ()
+    tool_call_id: str | None = None
 
     def __post_init__(self) -> None:
-        """阻止空消息和错误角色进入会话历史。"""
+        """验证不同消息角色允许使用的字段组合。"""
         if not isinstance(self.role, MessageRole):
             raise ValueError("role 必须是 MessageRole")
 
-        object.__setattr__(self, "content", _require_text(self.content, "content"))
+        if not isinstance(self.tool_calls, tuple):
+            raise ValueError("tool_calls 必须是元组")
+
+        if not all(isinstance(call, ToolCall) for call in self.tool_calls):
+            raise ValueError("tool_calls 中的元素必须是 ToolCall")
+
+        if self.role in {MessageRole.SYSTEM, MessageRole.USER}:
+            if self.tool_calls:
+                raise ValueError("系统和用户消息不能包含工具调用")
+
+            if self.tool_call_id is not None:
+                raise ValueError("系统和用户消息不能包含 tool_call_id")
+
+            object.__setattr__(
+                self,
+                "content",
+                _require_text(self.content, "content"),
+            )
+            return
+
+        if self.role is MessageRole.ASSISTANT:
+            if self.tool_call_id is not None:
+                raise ValueError("助手消息不能包含 tool_call_id")
+
+            if self.tool_calls:
+                if self.content is not None:
+                    raise ValueError("助手工具请求不能包含文本内容")
+                return
+
+            object.__setattr__(
+                self,
+                "content",
+                _require_text(self.content, "content"),
+            )
+            return
+
+        if self.tool_calls:
+            raise ValueError("工具结果消息不能包含工具调用")
+
+        object.__setattr__(
+            self,
+            "content",
+            _require_text(self.content, "content"),
+        )
+        object.__setattr__(
+            self,
+            "tool_call_id",
+            _require_text(self.tool_call_id, "tool_call_id"),
+        )
+
+    @classmethod
+    def from_tool_result(cls, result: ToolResult) -> Message:
+        """把受控工具结果转换为会话中的工具消息。"""
+        if not isinstance(result, ToolResult):
+            raise ValueError("result 必须是 ToolResult")
+
+        return cls(
+            role=MessageRole.TOOL,
+            content=result.content,
+            tool_call_id=result.call_id,
+        )
 
 
 @dataclass(frozen=True, slots=True)
