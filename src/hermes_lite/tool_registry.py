@@ -1,14 +1,12 @@
 """HermesLite 的工具定义与参数校验注册表。"""
 
-from __future__ import annotations
-
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 import math
 import re
 
-from hermes_lite.domain import require_tool_name
-
+from hermes_lite.domain import ToolCall, ToolResult, require_tool_name
 
 _PARAMETER_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _SUPPORTED_JSON_TYPES = frozenset({"string", "integer", "number", "boolean"})
@@ -16,6 +14,13 @@ _SUPPORTED_JSON_TYPES = frozenset({"string", "integer", "number", "boolean"})
 
 class ToolRegistryError(ValueError):
     """工具声明、查询或参数校验不符合规则时抛出。"""
+
+
+ToolHandler = Callable[[dict[str, object]], str]
+
+
+class ToolExecutionError(Exception):
+    """工具主动报告可安全展示的执行失败时抛出。"""
 
 
 class ToolRiskLevel(str, Enum):
@@ -159,6 +164,7 @@ class ToolDefinition:
     description: str
     parameters_schema: dict[str, object]
     risk_level: ToolRiskLevel
+    handler: ToolHandler | None = None
 
     def __post_init__(self) -> None:
         """验证工具定义，避免不完整声明进入注册表。"""
@@ -176,6 +182,9 @@ class ToolDefinition:
 
         if not isinstance(self.risk_level, ToolRiskLevel):
             raise ToolRegistryError("risk_level 必须是 ToolRiskLevel")
+
+        if self.handler is not None and not callable(self.handler):
+            raise ToolRegistryError("handler 必须是可调用对象")
 
     def to_model_definition(self) -> dict[str, object]:
         """转换为模型可见的 OpenAI 兼容工具定义。"""
@@ -200,6 +209,9 @@ class ToolRegistry:
         """登记一项工具，不允许名称重复。"""
         if not isinstance(definition, ToolDefinition):
             raise ToolRegistryError("definition 必须是 ToolDefinition")
+
+        if definition.handler is None:
+            raise ToolRegistryError(f"工具缺少执行函数: {definition.name}")
 
         if definition.name in self._definitions:
             raise ToolRegistryError(f"工具已登记: {definition.name}")
@@ -273,3 +285,53 @@ class ToolRegistry:
                 )
 
         return dict(arguments)
+
+    def execute(self, call: ToolCall) -> ToolResult:
+        """校验并执行已登记工具，始终返回结构化结果。"""
+        if not isinstance(call, ToolCall):
+            raise TypeError("call 必须是 ToolCall")
+
+        try:
+            definition = self.get(call.tool_name)
+            validated_arguments = self.validate_arguments(
+                call.tool_name,
+                call.arguments,
+            )
+        except ToolRegistryError as error:
+            return ToolResult(
+                call_id=call.call_id,
+                tool_name=call.tool_name,
+                content=f"工具调用被拒绝: {error}",
+                is_error=True,
+            )
+
+        handler = definition.handler
+        assert handler is not None
+
+        try:
+            content = handler(validated_arguments)
+
+            if not isinstance(content, str) or not content.strip():
+                raise ToolExecutionError("工具返回了无效内容")
+        except ToolExecutionError as error:
+            detail = str(error).strip() or "工具主动报告失败"
+            return ToolResult(
+                call_id=call.call_id,
+                tool_name=call.tool_name,
+                content=f"工具执行失败: {detail}",
+                is_error=True,
+            )
+        except Exception:
+            return ToolResult(
+                call_id=call.call_id,
+                tool_name=call.tool_name,
+                content="工具执行失败：工具内部发生未预期错误",
+                is_error=True,
+            )
+
+        return ToolResult(
+            call_id=call.call_id,
+            tool_name=call.tool_name,
+            content=content,
+            is_error=False,
+        )

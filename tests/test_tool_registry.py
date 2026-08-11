@@ -8,9 +8,18 @@ from hermes_lite.tool_registry import (
     ToolRegistryError,
     ToolRiskLevel,
 )
+from hermes_lite.domain import ToolCall
+from hermes_lite.tool_registry import ToolExecutionError, ToolHandler
 
 
-def make_summary_definition() -> ToolDefinition:
+def default_handler(arguments: dict[str, object]) -> str:
+    """返回确定性的测试结果，不执行外部操作。"""
+    return f"摘要：{arguments['text']}"
+
+
+def make_summary_definition(
+    handler: ToolHandler | None = default_handler,
+) -> ToolDefinition:
     """创建一项供测试使用的只读工具定义。"""
     return ToolDefinition(
         name="summarize_text",
@@ -39,13 +48,16 @@ def make_summary_definition() -> ToolDefinition:
             "additionalProperties": False,
         },
         risk_level=ToolRiskLevel.READ_ONLY,
+        handler=handler,
     )
 
 
-def make_registry() -> ToolRegistry:
+def make_registry(
+    handler: ToolHandler | None = default_handler,
+) -> ToolRegistry:
     """创建已经登记测试工具的注册表。"""
     registry = ToolRegistry()
-    registry.register(make_summary_definition())
+    registry.register(make_summary_definition(handler))
     return registry
 
 
@@ -164,3 +176,119 @@ def test_tool_definition_rejects_unsupported_parameter_type() -> None:
             },
             risk_level=ToolRiskLevel.READ_ONLY,
         )
+
+
+def test_registry_rejects_tool_without_handler() -> None:
+    """进入执行层的工具必须显式绑定执行函数。"""
+    registry = ToolRegistry()
+
+    with pytest.raises(ToolRegistryError, match="缺少执行函数"):
+        registry.register(make_summary_definition(handler=None))
+
+
+def test_execute_returns_structured_success_result() -> None:
+    """已登记工具应返回可关联的成功结果。"""
+    registry = make_registry()
+
+    result = registry.execute(
+        ToolCall(
+            call_id="call-1",
+            tool_name="summarize_text",
+            arguments={"text": "受控执行验证"},
+        )
+    )
+
+    assert result.call_id == "call-1"
+    assert result.tool_name == "summarize_text"
+    assert result.content == "摘要：受控执行验证"
+    assert result.is_error is False
+
+
+def test_execute_converts_unknown_tool_to_error_result() -> None:
+    """未知工具不能抛到 Agent Loop，而应转为结构化失败结果。"""
+    registry = ToolRegistry()
+
+    result = registry.execute(
+        ToolCall(
+            call_id="call-1",
+            tool_name="delete_all_files",
+            arguments={},
+        )
+    )
+
+    assert result.is_error is True
+    assert "未知工具" in result.content
+
+
+def test_execute_converts_invalid_arguments_to_error_result() -> None:
+    """参数校验失败也应产生结构化失败结果。"""
+    registry = make_registry()
+
+    result = registry.execute(
+        ToolCall(
+            call_id="call-1",
+            tool_name="summarize_text",
+            arguments={},
+        )
+    )
+
+    assert result.is_error is True
+    assert "缺少必填参数" in result.content
+
+
+def test_execute_keeps_safe_expected_failure_message() -> None:
+    """工具可主动提供已经脱敏的失败原因。"""
+    def failing_handler(arguments: dict[str, object]) -> str:
+        raise ToolExecutionError("测试工具暂时不可用")
+
+    registry = make_registry(handler=failing_handler)
+
+    result = registry.execute(
+        ToolCall(
+            call_id="call-1",
+            tool_name="summarize_text",
+            arguments={"text": "测试"},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.content == "工具执行失败: 测试工具暂时不可用"
+
+
+def test_execute_hides_unexpected_exception_detail() -> None:
+    """未预期异常的内部内容不能直接返回给调用方。"""
+    def broken_handler(arguments: dict[str, object]) -> str:
+        raise RuntimeError("内部密钥不应泄露")
+
+    registry = make_registry(handler=broken_handler)
+
+    result = registry.execute(
+        ToolCall(
+            call_id="call-1",
+            tool_name="summarize_text",
+            arguments={"text": "测试"},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.content == "工具执行失败：工具内部发生未预期错误"
+    assert "内部密钥" not in result.content
+
+
+def test_execute_rejects_invalid_handler_return_value() -> None:
+    """工具返回非文本内容时不能伪装成成功结果。"""
+    def invalid_handler(arguments: dict[str, object]) -> str:
+        return 123  # type: ignore[return-value]
+
+    registry = make_registry(handler=invalid_handler)
+
+    result = registry.execute(
+        ToolCall(
+            call_id="call-1",
+            tool_name="summarize_text",
+            arguments={"text": "测试"},
+        )
+    )
+
+    assert result.is_error is True
+    assert "工具返回了无效内容" in result.content
