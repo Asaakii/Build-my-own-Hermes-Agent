@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import json
 import pytest
 import httpx
 from openai import APIStatusError
@@ -16,7 +17,7 @@ from hermes_lite.model_client import (
     ModelTimeoutError,
 )
 import hermes_lite.model_client as model_client_module
-from hermes_lite.domain import Message, MessageRole, ToolCall
+from hermes_lite.domain import Message, MessageRole, ToolCall, ToolResult
 
 def make_config() -> ModelConfig:
     """构造不含真实密钥的测试配置。"""
@@ -38,6 +39,50 @@ def make_completion(content: object) -> SimpleNamespace:
             ),
         ],
     )
+
+
+def make_tool_completion(raw_arguments: object) -> SimpleNamespace:
+    """构造最小的 OpenAI 风格工具调用响应。"""
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="call-1",
+                            function=SimpleNamespace(
+                                name="echo_text",
+                                arguments=raw_arguments,
+                            ),
+                        )
+                    ],
+                )
+            )
+        ]
+    )
+
+
+def make_tool_definition() -> dict[str, object]:
+    """构造供模型客户端测试使用的工具定义。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": "echo_text",
+            "description": "回显文本。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "需要回显的文本。",
+                    }
+                },
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 class FakeCompletions:
@@ -295,3 +340,122 @@ def test_main_prints_configuration_error(
         capsys.readouterr().out
         == "模型请求失败: 缺少必备配置：LLM_API_KEY\n"
     )
+
+
+def test_respond_returns_text_assistant_message() -> None:
+    """工具感知接口也可以返回普通文本回答。"""
+    fake_client = FakeOpenAIClient(response=make_completion("最终回答"))
+    client = ModelClient(make_config(), client=fake_client)
+
+    response = client.respond(
+        [Message(role=MessageRole.USER, content="请回答。")],
+        [make_tool_definition()],
+    )
+
+    assert response.role is MessageRole.ASSISTANT
+    assert response.content == "最终回答"
+    assert response.tool_calls == ()
+    assert fake_client.completions.requests[0]["tool_choice"] == "auto"
+
+
+def test_respond_parses_structured_tool_call() -> None:
+    """模型返回的函数调用应转换为领域 ToolCall。"""
+    fake_client = FakeOpenAIClient(
+        response=make_tool_completion('{"text": "工具验证"}')
+    )
+    client = ModelClient(make_config(), client=fake_client)
+
+    response = client.respond(
+        [Message(role=MessageRole.USER, content="请使用 echo_text。")],
+        [make_tool_definition()],
+    )
+
+    assert response.content is None
+    assert response.tool_calls[0] == ToolCall(
+        call_id="call-1",
+        tool_name="echo_text",
+        arguments={"text": "工具验证"},
+    )
+
+
+def test_respond_serializes_structured_tool_history() -> None:
+    """工具请求和工具结果必须按 OpenAI 兼容字段发送。"""
+    fake_client = FakeOpenAIClient(response=make_completion("处理完成"))
+    client = ModelClient(make_config(), client=fake_client)
+    call = ToolCall(
+        call_id="call-1",
+        tool_name="echo_text",
+        arguments={"text": "test"},
+    )
+    tool_message = Message.from_tool_result(
+        ToolResult(
+            call_id="call-1",
+            tool_name="echo_text",
+            content="回显：test",
+        )
+    )
+
+    client.respond(
+        [
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=None,
+                tool_calls=(call,),
+            ),
+            tool_message,
+        ],
+        [make_tool_definition()],
+    )
+
+    request_messages = fake_client.completions.requests[0]["messages"]
+    assert request_messages[0]["tool_calls"][0]["id"] == "call-1"
+    assert request_messages[0]["tool_calls"][0]["function"]["arguments"] == (
+        json.dumps({"text": "test"}, ensure_ascii=False)
+    )
+    assert request_messages[1] == {
+        "role": "tool",
+        "content": "回显：test",
+        "tool_call_id": "call-1",
+    }
+
+
+@pytest.mark.parametrize("raw_arguments", ["not-json", "[]"])
+def test_respond_rejects_invalid_tool_arguments(
+    raw_arguments: str,
+) -> None:
+    """工具参数必须是 JSON 对象，不能是任意文本或数组。"""
+    fake_client = FakeOpenAIClient(
+        response=make_tool_completion(raw_arguments)
+    )
+    client = ModelClient(make_config(), client=fake_client)
+
+    with pytest.raises(ModelResponseError):
+        client.respond(
+            [Message(role=MessageRole.USER, content="测试")],
+            [make_tool_definition()],
+        )
+
+
+def test_respond_rejects_response_without_text_or_tool_call() -> None:
+    """模型不能返回既无文本也无工具调用的空助手消息。"""
+    fake_client = FakeOpenAIClient(response=make_completion(None))
+    client = ModelClient(make_config(), client=fake_client)
+
+    with pytest.raises(ModelResponseError):
+        client.respond(
+            [Message(role=MessageRole.USER, content="测试")],
+            [make_tool_definition()],
+        )
+
+
+def test_ask_messages_rejects_unexpected_tool_call_response() -> None:
+    """纯文本接口收到工具调用响应时必须明确失败。"""
+    fake_client = FakeOpenAIClient(
+        response=make_tool_completion('{"text": "测试"}')
+    )
+    client = ModelClient(make_config(), client=fake_client)
+
+    with pytest.raises(ModelResponseError, match="纯文本请求不应返回工具调用"):
+        client.ask_messages(
+            [Message(role=MessageRole.USER, content="普通文本问题")]
+        )
