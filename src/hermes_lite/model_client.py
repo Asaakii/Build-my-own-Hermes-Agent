@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import logging
 from typing import Any
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
-from hermes_lite.config import ConfigurationError, ModelConfig, load_model_config
-
+from hermes_lite.domain import Message, MessageRole
+from hermes_lite.config import (
+    ConfigurationError,
+    ModelConfig,
+    load_model_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,24 +62,39 @@ class ModelClient:
             timeout=config.timeout_seconds,
         )
 
-    def ask_text(self, system_prompt: str, user_prompt: str) -> str:
-        """发送一轮纯文本请求，并返回去除首尾空白后的回答。"""
-        system_prompt = _require_prompt(system_prompt, "system_prompt")
-        user_prompt = _require_prompt(user_prompt, "user_prompt")
+    def ask_messages(self, messages: Sequence[Message]) -> str:
+        """发送一组已验证的会话消息，并返回模型文本回答。"""
+        message_list = list(messages)
+
+        if not message_list:
+            raise ValueError("messages 不能为空")
+
+        if not all(isinstance(message, Message) for message in message_list):
+            raise ValueError("messages 中的元素必须是 Message")
+
+        # 当前阶段尚未实现 tool_call_id，因此不能伪造 OpenAI 工具消息。
+        if any(message.role is MessageRole.TOOL for message in message_list):
+            raise ValueError("当前文本客户端暂不支持工具消息")
+
+        request_messages = [
+            {
+                "role": message.role.value,
+                "content": message.content,
+            }
+            for message in message_list
+        ]
 
         logger.info(
-            "开始模型请求：provider=%s model=%s",
+            "开始模型请求：provider=%s model=%s messages=%d",
             self._config.provider,
             self._config.model,
+            len(request_messages),
         )
 
         try:
             completion = self._client.chat.completions.create(
                 model=self._config.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=request_messages,
                 temperature=0.2,
             )
         except (APITimeoutError, TimeoutError) as error:
@@ -98,6 +118,18 @@ class ModelClient:
 
         logger.info("模型请求成功")
         return content.strip()
+
+    def ask_text(self, system_prompt: str, user_prompt: str) -> str:
+        """提供单轮系统提示词与用户提示词的便捷接口。"""
+        system_prompt = _require_prompt(system_prompt, "system_prompt")
+        user_prompt = _require_prompt(user_prompt, "user_prompt")
+
+        return self.ask_messages(
+            [
+                Message(role=MessageRole.SYSTEM, content=system_prompt),
+                Message(role=MessageRole.USER, content=user_prompt),
+            ],
+        )
 
 
 def main() -> int:

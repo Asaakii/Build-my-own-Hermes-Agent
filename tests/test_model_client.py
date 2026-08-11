@@ -5,8 +5,9 @@ from types import SimpleNamespace
 import pytest
 import httpx
 from openai import APIStatusError
+from hermes_lite.domain import Message, MessageRole
 
-from hermes_lite.config import ModelConfig
+from hermes_lite.config import ConfigurationError, ModelConfig
 from hermes_lite.model_client import (
     ModelClient,
     ModelClientError,
@@ -14,7 +15,7 @@ from hermes_lite.model_client import (
     ModelServiceError,
     ModelTimeoutError,
 )
-
+import hermes_lite.model_client as model_client_module
 
 def make_config() -> ModelConfig:
     """构造不含真实密钥的测试配置。"""
@@ -169,3 +170,100 @@ def test_ask_text_converts_api_status_error() -> None:
 
     with pytest.raises(ModelServiceError, match="401"):
         client.ask_text("系统提示", "用户问题")
+
+
+def test_ask_messages_sends_complete_conversation_history() -> None:
+    """多消息接口应按原顺序发送完整会话历史。"""
+    fake_client = FakeOpenAIClient(response=make_completion("第二轮回答"))
+    client = ModelClient(make_config(), client=fake_client)
+    messages = [
+        Message(role=MessageRole.SYSTEM, content="系统提示"),
+        Message(role=MessageRole.USER, content="第一轮问题"),
+        Message(role=MessageRole.ASSISTANT, content="第一轮回答"),
+        Message(role=MessageRole.USER, content="第二轮问题"),
+    ]
+
+    answer = client.ask_messages(messages)
+
+    assert answer == "第二轮回答"
+    assert fake_client.completions.requests[0]["messages"] == [
+        {"role": "system", "content": "系统提示"},
+        {"role": "user", "content": "第一轮问题"},
+        {"role": "assistant", "content": "第一轮回答"},
+        {"role": "user", "content": "第二轮问题"},
+    ]
+
+
+def test_ask_messages_rejects_empty_history() -> None:
+    """模型客户端不能请求空会话。"""
+    client = ModelClient(make_config(), client=FakeOpenAIClient())
+
+    with pytest.raises(ValueError, match="messages 不能为空"):
+        client.ask_messages([])
+
+
+def test_ask_messages_rejects_non_message_item() -> None:
+    """调用方不能把任意对象伪装成会话消息。"""
+    client = ModelClient(make_config(), client=FakeOpenAIClient())
+
+    with pytest.raises(ValueError, match="Message"):
+        client.ask_messages(["not-a-message"])  # type: ignore[list-item]
+
+
+def test_ask_messages_rejects_tool_message_before_tool_support() -> None:
+    """工具消息在未实现 tool_call_id 前必须明确拒绝。"""
+    client = ModelClient(make_config(), client=FakeOpenAIClient())
+    messages = [
+        Message(role=MessageRole.TOOL, content="工具结果"),
+    ]
+
+    with pytest.raises(ValueError, match="暂不支持工具消息"):
+        client.ask_messages(messages)
+
+
+class FakeRuntimeClient:
+    """用于验证命令行入口的最小模型客户端替身。"""
+
+    def __init__(self, config: ModelConfig) -> None:
+        self.config = config
+
+    def ask_text(self, system_prompt: str, user_prompt: str) -> str:
+        """返回固定回答，避免入口测试访问真实模型。"""
+        return "模型连接验证成功。"
+
+
+def test_main_prints_answer_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """命令行入口在成功时应输出模型回答并返回零。"""
+    monkeypatch.setattr(model_client_module, "load_model_config", make_config)
+    monkeypatch.setattr(model_client_module, "ModelClient", FakeRuntimeClient)
+
+    exit_code = model_client_module.main()
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == "模型回答: 模型连接验证成功。\n"
+
+
+def test_main_prints_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """命令行入口应把配置错误转换为可理解的提示。"""
+    def raise_configuration_error() -> ModelConfig:
+        raise ConfigurationError("缺少必备配置：LLM_API_KEY")
+
+    monkeypatch.setattr(
+        model_client_module,
+        "load_model_config",
+        raise_configuration_error,
+    )
+
+    exit_code = model_client_module.main()
+
+    assert exit_code == 1
+    assert (
+        capsys.readouterr().out
+        == "模型请求失败: 缺少必备配置：LLM_API_KEY\n"
+    )
