@@ -1,16 +1,32 @@
-"""HermesLite 的 SQLite 状态数据库初始化与模式管理。"""
+"""HermesLite 的 SQLite 状态数据库初始化与领域对象读写。"""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import sqlite3
 
 from dotenv import load_dotenv
 
+from hermes_lite.coding_task import (
+    CodingTaskReport,
+    ToolRoundSummary,
+    VerificationStatus,
+)
 from hermes_lite.config import DOTENV_PATH, PROJECT_ROOT
+from hermes_lite.domain import (
+    Message,
+    MessageRole,
+    Session,
+    TaskState,
+    TaskStatus,
+    ToolCall,
+    ToolResult,
+)
 
 
 DEFAULT_STATE_DB_RELATIVE_PATH = Path("data") / "hermes_lite.sqlite3"
@@ -18,7 +34,7 @@ SCHEMA_VERSION = 1
 
 
 class SQLiteStateStoreError(ValueError):
-    """SQLite 状态数据库配置或初始化失败时抛出。"""
+    """SQLite 状态数据库配置、初始化或记录恢复失败时抛出。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +63,25 @@ class SQLiteStateConfig:
             raise SQLiteStateStoreError("状态数据库必须使用 .sqlite3 后缀")
 
         object.__setattr__(self, "database_path", database_path)
+
+
+@dataclass(frozen=True, slots=True)
+class StoredCodingTask:
+    """从 SQLite 恢复的一条任务状态及其可选最终报告。"""
+
+    task: TaskState
+    report: CodingTaskReport | None
+
+    def __post_init__(self) -> None:
+        """确保恢复结果仍使用已验证的领域对象。"""
+        if not isinstance(self.task, TaskState):
+            raise SQLiteStateStoreError("task 必须是 TaskState")
+
+        if self.report is not None and not isinstance(
+            self.report,
+            CodingTaskReport,
+        ):
+            raise SQLiteStateStoreError("report 必须是 CodingTaskReport 或 None")
 
 
 def _get_database_relative_path(environment: Mapping[str, str]) -> Path:
@@ -140,8 +175,71 @@ CREATE TABLE IF NOT EXISTS task_reports (
 """
 
 
+def _utc_now_text() -> str:
+    """生成可保存到 SQLite 的 UTC 时间文本。"""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _serialize_tool_calls(calls: tuple[ToolCall, ...]) -> str | None:
+    """把助手工具请求转换为稳定的 JSON 文本。"""
+    if not calls:
+        return None
+
+    payload = [
+        {
+            "call_id": call.call_id,
+            "tool_name": call.tool_name,
+            "arguments": call.arguments,
+        }
+        for call in calls
+    ]
+
+    try:
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise SQLiteStateStoreError("工具调用参数无法序列化为 JSON") from error
+
+
+def _deserialize_tool_calls(raw_value: object) -> tuple[ToolCall, ...]:
+    """把 SQLite 中的工具请求 JSON 恢复为领域对象。"""
+    if raw_value is None:
+        return ()
+
+    if not isinstance(raw_value, str):
+        raise SQLiteStateStoreError("工具调用记录格式无效")
+
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise SQLiteStateStoreError("工具调用记录不是有效 JSON") from error
+
+    if not isinstance(payload, list):
+        raise SQLiteStateStoreError("工具调用记录必须是列表")
+
+    if not all(isinstance(item, dict) for item in payload):
+        raise SQLiteStateStoreError("工具调用记录内容无效")
+
+    try:
+        return tuple(
+            ToolCall(
+                call_id=item["call_id"],
+                tool_name=item["tool_name"],
+                arguments=item["arguments"],
+            )
+            for item in payload
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SQLiteStateStoreError("工具调用记录内容无效") from error
+
+
 class SQLiteStateStore:
-    """负责建立 SQLite 状态数据库，不在本步读写领域对象。"""
+    """负责 SQLite 模式管理及正常领域对象的读写恢复。"""
 
     def __init__(self, config: SQLiteStateConfig) -> None:
         """保存已经验证的数据库配置。"""
@@ -191,6 +289,7 @@ class SQLiteStateStore:
 
     def schema_version(self) -> int:
         """读取已初始化数据库的模式版本。"""
+        self.initialize()
         connection: sqlite3.Connection | None = None
 
         try:
@@ -212,3 +311,271 @@ class SQLiteStateStore:
             return int(row[0])
         except (TypeError, ValueError) as error:
             raise SQLiteStateStoreError("状态数据库模式版本无效") from error
+
+    def save_session(self, session: Session) -> None:
+        """覆盖保存一条会话的完整、有序消息历史。"""
+        if not isinstance(session, Session):
+            raise SQLiteStateStoreError("session 必须是 Session")
+
+        self.initialize()
+        connection: sqlite3.Connection | None = None
+
+        try:
+            connection = self._connect()
+            now = _utc_now_text()
+
+            with connection:
+                connection.execute(
+                    "INSERT OR IGNORE INTO sessions (session_id, created_at) "
+                    "VALUES (?, ?)",
+                    (session.session_id, now),
+                )
+                connection.execute(
+                    "DELETE FROM messages WHERE session_id = ?",
+                    (session.session_id,),
+                )
+                rows = [
+                    (
+                        session.session_id,
+                        index,
+                        message.role.value,
+                        message.content,
+                        message.tool_call_id,
+                        _serialize_tool_calls(message.tool_calls),
+                        now,
+                    )
+                    for index, message in enumerate(session.messages)
+                ]
+
+                if rows:
+                    connection.executemany(
+                        "INSERT INTO messages "
+                        "(session_id, sequence_number, role, content, "
+                        "tool_call_id, tool_calls_json, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        rows,
+                    )
+        except sqlite3.Error as error:
+            raise SQLiteStateStoreError("无法保存会话记录") from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def load_session(self, session_id: object) -> Session | None:
+        """按会话标识恢复完整消息历史，不存在时返回 None。"""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise SQLiteStateStoreError("session_id 必须是非空文本")
+
+        self.initialize()
+        normalized_session_id = session_id.strip()
+        connection: sqlite3.Connection | None = None
+
+        try:
+            connection = self._connect()
+            exists = connection.execute(
+                "SELECT session_id FROM sessions WHERE session_id = ?",
+                (normalized_session_id,),
+            ).fetchone()
+
+            if exists is None:
+                return None
+
+            rows = connection.execute(
+                "SELECT role, content, tool_call_id, tool_calls_json "
+                "FROM messages WHERE session_id = ? "
+                "ORDER BY sequence_number",
+                (normalized_session_id,),
+            ).fetchall()
+            messages = [
+                Message(
+                    role=MessageRole(row[0]),
+                    content=row[1],
+                    tool_call_id=row[2],
+                    tool_calls=_deserialize_tool_calls(row[3]),
+                )
+                for row in rows
+            ]
+            return Session(
+                session_id=normalized_session_id,
+                messages=messages,
+            )
+        except (sqlite3.Error, ValueError) as error:
+            raise SQLiteStateStoreError("会话记录损坏或无法恢复") from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def save_coding_task(
+        self,
+        task: TaskState,
+        report: CodingTaskReport,
+    ) -> None:
+        """保存任务状态、每轮工具结果和最终编码报告。"""
+        if not isinstance(task, TaskState):
+            raise SQLiteStateStoreError("task 必须是 TaskState")
+
+        if not isinstance(report, CodingTaskReport):
+            raise SQLiteStateStoreError("report 必须是 CodingTaskReport")
+
+        if task.task_id != report.task_id:
+            raise SQLiteStateStoreError("任务状态与报告 task_id 不一致")
+
+        self.initialize()
+        connection: sqlite3.Connection | None = None
+
+        try:
+            connection = self._connect()
+            now = _utc_now_text()
+
+            with connection:
+                session_row = connection.execute(
+                    "SELECT session_id FROM sessions WHERE session_id = ?",
+                    (task.session_id,),
+                ).fetchone()
+
+                if session_row is None:
+                    raise SQLiteStateStoreError("任务所属会话尚未保存")
+
+                connection.execute(
+                    "INSERT INTO tasks "
+                    "(task_id, session_id, user_request, status, tool_rounds, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(task_id) DO UPDATE SET "
+                    "session_id = excluded.session_id, "
+                    "user_request = excluded.user_request, "
+                    "status = excluded.status, "
+                    "tool_rounds = excluded.tool_rounds, "
+                    "updated_at = excluded.updated_at",
+                    (
+                        task.task_id,
+                        task.session_id,
+                        task.user_request,
+                        task.status.value,
+                        task.tool_rounds,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM tool_results WHERE task_id = ?",
+                    (task.task_id,),
+                )
+
+                result_rows = [
+                    (
+                        task.task_id,
+                        summary.round_number,
+                        result_index,
+                        result.call_id,
+                        result.tool_name,
+                        result.content,
+                        int(result.is_error),
+                    )
+                    for summary in report.rounds
+                    for result_index, result in enumerate(summary.results)
+                ]
+
+                if result_rows:
+                    connection.executemany(
+                        "INSERT INTO tool_results "
+                        "(task_id, round_number, result_sequence, call_id, "
+                        "tool_name, content, is_error) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        result_rows,
+                    )
+
+                connection.execute(
+                    "INSERT INTO task_reports "
+                    "(task_id, status, verification, summary, created_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(task_id) DO UPDATE SET "
+                    "status = excluded.status, "
+                    "verification = excluded.verification, "
+                    "summary = excluded.summary, "
+                    "created_at = excluded.created_at",
+                    (
+                        report.task_id,
+                        report.status.value,
+                        report.verification.value,
+                        report.summary,
+                        now,
+                    ),
+                )
+        except sqlite3.Error as error:
+            raise SQLiteStateStoreError("无法保存任务记录") from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def load_coding_task(self, task_id: object) -> StoredCodingTask | None:
+        """恢复任务状态、工具结果和最终报告，不存在时返回 None。"""
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise SQLiteStateStoreError("task_id 必须是非空文本")
+
+        self.initialize()
+        normalized_task_id = task_id.strip()
+        connection: sqlite3.Connection | None = None
+
+        try:
+            connection = self._connect()
+            task_row = connection.execute(
+                "SELECT task_id, session_id, user_request, status, tool_rounds "
+                "FROM tasks WHERE task_id = ?",
+                (normalized_task_id,),
+            ).fetchone()
+
+            if task_row is None:
+                return None
+
+            task = TaskState(
+                task_id=task_row[0],
+                session_id=task_row[1],
+                user_request=task_row[2],
+                status=TaskStatus(task_row[3]),
+                tool_rounds=task_row[4],
+            )
+            report_row = connection.execute(
+                "SELECT status, verification, summary "
+                "FROM task_reports WHERE task_id = ?",
+                (normalized_task_id,),
+            ).fetchone()
+
+            if report_row is None:
+                return StoredCodingTask(task=task, report=None)
+
+            result_rows = connection.execute(
+                "SELECT round_number, result_sequence, call_id, tool_name, "
+                "content, is_error FROM tool_results WHERE task_id = ? "
+                "ORDER BY round_number, result_sequence",
+                (normalized_task_id,),
+            ).fetchall()
+            grouped_results: dict[int, list[ToolResult]] = {}
+
+            for row in result_rows:
+                grouped_results.setdefault(row[0], []).append(
+                    ToolResult(
+                        call_id=row[2],
+                        tool_name=row[3],
+                        content=row[4],
+                        is_error=bool(row[5]),
+                    )
+                )
+
+            report = CodingTaskReport(
+                task_id=task.task_id,
+                status=TaskStatus(report_row[0]),
+                verification=VerificationStatus(report_row[1]),
+                summary=report_row[2],
+                rounds=tuple(
+                    ToolRoundSummary(
+                        round_number=round_number,
+                        results=tuple(results),
+                    )
+                    for round_number, results in grouped_results.items()
+                ),
+            )
+            return StoredCodingTask(task=task, report=report)
+        except (sqlite3.Error, ValueError, TypeError) as error:
+            raise SQLiteStateStoreError("任务记录损坏或无法恢复") from error
+        finally:
+            if connection is not None:
+                connection.close()
