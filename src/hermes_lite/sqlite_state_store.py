@@ -30,7 +30,7 @@ from hermes_lite.domain import (
 
 
 DEFAULT_STATE_DB_RELATIVE_PATH = Path("data") / "hermes_lite.sqlite3"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SQLiteStateStoreError(ValueError):
@@ -184,6 +184,14 @@ CREATE TABLE IF NOT EXISTS tool_results (
     FOREIGN KEY (task_id) REFERENCES tasks(task_id)
 );
 
+CREATE TABLE IF NOT EXISTS long_term_memories (
+    memory_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_session_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    normalized_content TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS task_reports (
     task_id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
@@ -296,11 +304,34 @@ class SQLiteStateStore:
 
             with connection:
                 connection.executescript(_SCHEMA_SQL)
-                connection.execute(
-                    "INSERT OR IGNORE INTO schema_metadata (key, value) "
-                    "VALUES (?, ?)",
-                    ("schema_version", str(SCHEMA_VERSION)),
-                )
+                version_row = connection.execute(
+                    "SELECT value FROM schema_metadata WHERE key = ?",
+                    ("schema_version",),
+                ).fetchone()
+
+                if version_row is None:
+                    connection.execute(
+                        "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+                        ("schema_version", str(SCHEMA_VERSION)),
+                    )
+                else:
+                    try:
+                        stored_version = int(version_row[0])
+                    except (TypeError, ValueError) as error:
+                        raise SQLiteStateStoreError(
+                            "状态数据库模式版本无效",
+                        ) from error
+
+                    if stored_version > SCHEMA_VERSION:
+                        raise SQLiteStateStoreError(
+                            "状态数据库模式版本高于当前程序",
+                        )
+
+                    if stored_version < SCHEMA_VERSION:
+                        connection.execute(
+                            "UPDATE schema_metadata SET value = ? WHERE key = ?",
+                            (str(SCHEMA_VERSION), "schema_version"),
+                        )
         except sqlite3.Error as error:
             raise SQLiteStateStoreError("无法初始化状态数据库") from error
         finally:

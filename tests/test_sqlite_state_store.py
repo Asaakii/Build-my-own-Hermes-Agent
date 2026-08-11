@@ -86,6 +86,7 @@ def test_initialize_creates_all_state_tables(project_root: Path) -> None:
         "tasks",
         "tool_results",
         "task_reports",
+        "long_term_memories",
     }.issubset(table_names)
 
 
@@ -112,3 +113,37 @@ def test_initialize_reports_unusable_parent_directory(
 
     with pytest.raises(SQLiteStateStoreError, match="无法创建"):
         SQLiteStateStore(config).initialize()
+
+
+
+def test_initialize_upgrades_previous_schema_version(project_root: Path) -> None:
+    """已有旧版本数据库初始化后应升级到当前模式版本。"""
+    config = load_sqlite_state_config({})
+    config.database_path.parent.mkdir(parents=True)
+    connection = sqlite3.connect(config.database_path)
+    try:
+        with connection:
+            connection.execute(
+                "CREATE TABLE schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            )
+            connection.execute(
+                "INSERT INTO schema_metadata (key, value) VALUES (?, ?)",
+                ("schema_version", "1"),
+            )
+    finally:
+        connection.close()
+
+    store = SQLiteStateStore(config)
+    store.initialize()
+
+    assert store.schema_version() == SCHEMA_VERSION
+    connection = sqlite3.connect(config.database_path)
+    try:
+        table_row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = ? AND name = ?",
+            ("table", "long_term_memories"),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert table_row == ("long_term_memories",)
