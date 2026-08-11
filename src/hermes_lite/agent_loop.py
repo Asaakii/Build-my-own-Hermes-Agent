@@ -15,11 +15,20 @@ from hermes_lite.domain import (
     TaskStatus,
 )
 from hermes_lite.model_client import ModelClientError
+from hermes_lite.prompt_builder import (
+    HistorySummarizer,
+    PromptBuilder,
+    PromptBuilderError,
+)
 
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是 HermesLite，一个用于学习 Agent 开发的助手。"
     "当前只能进行文本对话，不能声称自己执行了工具或修改了文件。"
+)
+
+DEFAULT_TEXT_WORKSPACE_RULES = (
+    "当前文本模式不提供工作区访问权限，也不能声称执行了文件操作。"
 )
 
 
@@ -62,13 +71,32 @@ class TextAgent:
         self,
         model: ConversationModel,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        prompt_builder: PromptBuilder | None = None,
+        history_summarizer: HistorySummarizer | None = None,
     ) -> None:
-        """保存模型接口和固定系统提示词。"""
+        """保存模型与可替换的上下文构建依赖。"""
+        if prompt_builder is not None and not isinstance(
+            prompt_builder,
+            PromptBuilder,
+        ):
+            raise ValueError("prompt_builder 必须是 PromptBuilder 或 None")
+
         self._model = model
         self._system_message = Message(
             role=MessageRole.SYSTEM,
             content=system_prompt,
         )
+        self._prompt_builder = prompt_builder or PromptBuilder()
+        self._history_summarizer = history_summarizer
+
+    def _build_model_messages(self, session: Session) -> tuple[Message, ...]:
+        """通过统一 Builder 构建本轮可发送给模型的上下文。"""
+        return self._prompt_builder.build(
+            safety_rules=self._system_message.content,
+            workspace_rules=DEFAULT_TEXT_WORKSPACE_RULES,
+            history=session.messages,
+            summarizer=self._history_summarizer,
+        ).messages
 
     def run_turn(
         self,
@@ -93,9 +121,9 @@ class TextAgent:
 
         try:
             answer = self._model.ask_messages(
-                [self._system_message, *session.messages],
+                self._build_model_messages(session),
             )
-        except ModelClientError as error:
+        except (ModelClientError, PromptBuilderError) as error:
             task.status = TaskStatus.FAILED
             return AgentTurn(
                 task=task,

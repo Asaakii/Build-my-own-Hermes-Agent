@@ -17,12 +17,21 @@ from hermes_lite.domain import (
     ToolResult,
 )
 from hermes_lite.model_client import ModelClientError
+from hermes_lite.prompt_builder import (
+    HistorySummarizer,
+    PromptBuilder,
+    PromptBuilderError,
+)
 from hermes_lite.tool_registry import ToolRegistry
 
 
 DEFAULT_TOOL_SYSTEM_PROMPT = (
     "你是 HermesLite。需要外部观察时，只能请求已提供的工具；"
     "收到工具结果后继续判断；完成后返回简洁文本回答。"
+)
+
+DEFAULT_TOOL_WORKSPACE_RULES = (
+    "工具只能访问已配置的受限工作区，不能绕过注册表或路径边界。"
 )
 
 
@@ -94,6 +103,8 @@ class ToolAgent:
         registry: ToolRegistry,
         max_tool_rounds: int = 3,
         system_prompt: str = DEFAULT_TOOL_SYSTEM_PROMPT,
+        prompt_builder: PromptBuilder | None = None,
+        history_summarizer: HistorySummarizer | None = None,
     ) -> None:
         """保存模型、工具注册表和每次任务允许的最大工具轮数。"""
         if not isinstance(registry, ToolRegistry):
@@ -106,6 +117,12 @@ class ToolAgent:
         ):
             raise ValueError("max_tool_rounds 必须是正整数")
 
+        if prompt_builder is not None and not isinstance(
+            prompt_builder,
+            PromptBuilder,
+        ):
+            raise ValueError("prompt_builder 必须是 PromptBuilder 或 None")
+
         self._model = model
         self._registry = registry
         self._max_tool_rounds = max_tool_rounds
@@ -113,6 +130,18 @@ class ToolAgent:
             role=MessageRole.SYSTEM,
             content=system_prompt,
         )
+        self._prompt_builder = prompt_builder or PromptBuilder()
+        self._history_summarizer = history_summarizer
+
+    def _build_model_messages(self, session: Session) -> tuple[Message, ...]:
+        """构建含工具定义和受限历史的模型上下文。"""
+        return self._prompt_builder.build(
+            safety_rules=self._system_message.content,
+            workspace_rules=DEFAULT_TOOL_WORKSPACE_RULES,
+            tool_definitions=self._registry.list_model_definitions(),
+            history=session.messages,
+            summarizer=self._history_summarizer,
+        ).messages
 
     def _failed_turn(
         self,
@@ -157,10 +186,10 @@ class ToolAgent:
         while True:
             try:
                 response = self._model.respond(
-                    [self._system_message, *session.messages],
+                    self._build_model_messages(session),
                     self._registry.list_model_definitions(),
                 )
-            except ModelClientError as error:
+            except (ModelClientError, PromptBuilderError) as error:
                 return self._failed_turn(
                     task,
                     tool_results,
