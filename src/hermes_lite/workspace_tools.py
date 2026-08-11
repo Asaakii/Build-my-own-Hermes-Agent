@@ -26,6 +26,9 @@ MAX_SEARCH_RESULTS = 100
 MAX_SEARCH_LINE_CHARACTERS = 300
 MAX_PATH_CHARACTERS = 512
 MAX_QUERY_CHARACTERS = 200
+# 写入限制独立于读取限制，避免一次创建过大内容。
+MAX_WRITE_BYTES = 64 * 1024
+MAX_WRITE_CHARACTERS = 16_000
 
 
 def _require_text_argument(
@@ -64,6 +67,50 @@ def _resolve_existing_path(workspace: Workspace, raw_path: str) -> Path:
         raise ToolExecutionError("目标路径不存在")
 
     return path
+
+
+def _resolve_new_file_path(workspace: Workspace, raw_path: str) -> Path:
+    """解析待创建路径，并确认它不会覆盖已有目标。"""
+    try:
+        path = workspace.resolve_path(raw_path)
+    except WorkspaceError as error:
+        raise ToolExecutionError(str(error)) from error
+
+    if path.exists():
+        raise ToolExecutionError("目标文件已经存在，拒绝覆盖")
+
+    if not path.parent.is_dir():
+        raise ToolExecutionError("目标父目录不存在或不是目录")
+
+    return path
+
+
+def _require_write_content(arguments: object) -> str:
+    """读取待写入文本，保留原始空白并限制大小。"""
+    if not isinstance(arguments, dict):
+        raise ToolExecutionError("工具参数必须是字典")
+
+    content = arguments.get("content")
+
+    if not isinstance(content, str):
+        raise ToolExecutionError("content 必须是文本")
+
+    if "\x00" in content:
+        raise ToolExecutionError("content 不能包含空字节")
+
+    if len(content) > MAX_WRITE_CHARACTERS:
+        raise ToolExecutionError(
+            f"content 长度不能超过 {MAX_WRITE_CHARACTERS} 个字符"
+        )
+
+    encoded_content = content.encode("utf-8")
+
+    if len(encoded_content) > MAX_WRITE_BYTES:
+        raise ToolExecutionError(
+            f"content 超过写入上限：{MAX_WRITE_BYTES} 字节"
+        )
+
+    return content
 
 
 def _display_relative_path(workspace: Workspace, path: Path) -> str:
@@ -161,6 +208,34 @@ def list_files(workspace: Workspace, arguments: object) -> str:
         result += "\n[已跳过不安全的符号链接]"
 
     return result
+
+
+def create_text_file(workspace: Workspace, arguments: object) -> str:
+    """在工作区已有目录中创建一个新的 UTF-8 文本文件。"""
+    raw_path = _require_text_argument(
+        arguments,
+        "path",
+        MAX_PATH_CHARACTERS,
+    )
+    content = _require_write_content(arguments)
+    target = _resolve_new_file_path(workspace, raw_path)
+
+    try:
+        # x 模式只允许新建；目标若在检查后被其他进程创建，也不会覆盖。
+        with target.open("x", encoding="utf-8") as file:
+            file.write(content)
+    except FileExistsError as error:
+        raise ToolExecutionError("目标文件已经存在，拒绝覆盖") from error
+    except OSError as error:
+        raise ToolExecutionError("无法创建目标文件") from error
+
+    displayed_path = _display_relative_path(workspace, target)
+    byte_count = len(content.encode("utf-8"))
+
+    return (
+        f"已创建文本文件: {displayed_path}"
+        f"（{len(content)} 个字符，{byte_count} 字节）"
+    )
 
 
 def read_file(workspace: Workspace, arguments: object) -> str:
@@ -356,6 +431,10 @@ def build_workspace_tool_registry(workspace: Workspace) -> ToolRegistry:
         """调用文本检索工具。"""
         return search_text(workspace, arguments)
 
+    def create_text_file_handler(arguments: dict[str, object]) -> str:
+        """调用创建文本文件工具。"""
+        return create_text_file(workspace, arguments)
+
     registry.register(
         ToolDefinition(
             name="list_files",
@@ -417,5 +496,27 @@ def build_workspace_tool_registry(workspace: Workspace) -> ToolRegistry:
             handler=search_text_handler,
         )
     )
-
+    registry.register(
+        ToolDefinition(
+            name="create_text_file",
+            description="在受限工作区已有目录中创建新的 UTF-8 文本文件，不允许覆盖已有文件。",
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "工作区内相对文件路径；父目录必须已存在。",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "需要写入的新文件文本内容。",
+                    },
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+            risk_level=ToolRiskLevel.WRITE,
+            handler=create_text_file_handler,
+        )
+    )
     return registry

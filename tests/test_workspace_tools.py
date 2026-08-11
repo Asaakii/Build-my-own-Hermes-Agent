@@ -14,6 +14,7 @@ from hermes_lite.workspace_tools import (
     list_files,
     read_file,
     search_text,
+    create_text_file,
 )
 
 
@@ -203,7 +204,7 @@ def test_workspace_tools_run_through_registry(
 
     assert result.is_error is False
     assert "hello.txt" in result.content
-    assert len(registry.list_model_definitions()) == 3
+    assert len(registry.list_model_definitions()) == 4
 
 
 def test_search_text_marks_truncated_paths(
@@ -224,3 +225,111 @@ def test_search_text_marks_truncated_paths(
     result = search_text(workspace, {"path": ".", "query": "关键字"})
 
     assert "[检索路径数已截断，最多检查 1 个路径]" in result
+
+
+def test_create_text_file_writes_utf8_content(
+    workspace: Workspace,
+) -> None:
+    """创建工具应在已有目录内写入指定 UTF-8 文本。"""
+    (workspace.root / "notes").mkdir()
+
+    result = create_text_file(
+        workspace,
+        {
+            "path": "notes/today.txt",
+            "content": "创建型写入验证。",
+        },
+    )
+
+    assert "已创建文本文件: notes/today.txt" in result
+    assert (workspace.root / "notes" / "today.txt").read_text(
+        encoding="utf-8"
+    ) == "创建型写入验证。"
+
+
+def test_create_text_file_rejects_existing_file(
+    workspace: Workspace,
+) -> None:
+    """创建工具不能覆盖已有文件，原内容必须保留。"""
+    target = workspace.root / "existing.txt"
+    target.write_text("原始内容", encoding="utf-8")
+
+    with pytest.raises(ToolExecutionError, match="拒绝覆盖"):
+        create_text_file(
+            workspace,
+            {"path": "existing.txt", "content": "新内容"},
+        )
+
+    assert target.read_text(encoding="utf-8") == "原始内容"
+
+
+def test_create_text_file_rejects_missing_parent(
+    workspace: Workspace,
+) -> None:
+    """创建工具不能隐式创建未知目录。"""
+    with pytest.raises(ToolExecutionError, match="父目录不存在"):
+        create_text_file(
+            workspace,
+            {"path": "missing/new.txt", "content": "内容"},
+        )
+
+
+def test_create_text_file_rejects_parent_traversal(
+    workspace: Workspace,
+) -> None:
+    """创建工具不能通过 ../ 写到工作区外。"""
+    with pytest.raises(ToolExecutionError, match="父目录穿越"):
+        create_text_file(
+            workspace,
+            {"path": "../outside.txt", "content": "内容"},
+        )
+
+
+def test_create_text_file_rejects_null_byte(
+    workspace: Workspace,
+) -> None:
+    """写入内容不能含空字节，避免生成二进制文件。"""
+    with pytest.raises(ToolExecutionError, match="空字节"):
+        create_text_file(
+            workspace,
+            {"path": "binary.txt", "content": "hello\x00world"},
+        )
+
+
+def test_create_text_file_rejects_oversized_content(
+    workspace: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """超过字节上限时不能创建文件。"""
+    monkeypatch.setattr(workspace_tools_module, "MAX_WRITE_BYTES", 5)
+
+    with pytest.raises(ToolExecutionError, match="超过写入上限"):
+        create_text_file(
+            workspace,
+            {"path": "large.txt", "content": "超过五个字节"},
+        )
+
+    assert not (workspace.root / "large.txt").exists()
+
+
+def test_create_text_file_runs_through_registry(
+    workspace: Workspace,
+) -> None:
+    """创建工具也必须经过注册表的受控执行入口。"""
+    registry = build_workspace_tool_registry(workspace)
+
+    result = registry.execute(
+        ToolCall(
+            call_id="call-create",
+            tool_name="create_text_file",
+            arguments={
+                "path": "created.txt",
+                "content": "注册表创建验证。",
+            },
+        )
+    )
+
+    assert result.is_error is False
+    assert (workspace.root / "created.txt").read_text(
+        encoding="utf-8"
+    ) == "注册表创建验证。"
