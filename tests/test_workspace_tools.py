@@ -205,7 +205,7 @@ def test_workspace_tools_run_through_registry(
 
     assert result.is_error is False
     assert "hello.txt" in result.content
-    assert len(registry.list_model_definitions()) == 5
+    assert len(registry.list_model_definitions()) == 6
 
 
 def test_search_text_marks_truncated_paths(
@@ -469,3 +469,26 @@ def test_replace_text_once_runs_through_registry(
 
     assert result.is_error is False
     assert target.read_text(encoding="utf-8") == "新内容"
+
+def test_run_pytest_runs_through_registry(
+    workspace: Workspace,
+) -> None:
+    """测试执行工具也必须通过注册表进入受控执行器。"""
+    tests_directory = workspace.root / "tests"
+    tests_directory.mkdir()
+    (tests_directory / "test_sample.py").write_text(
+        "def test_sample() -> None:\n    assert True\n",
+        encoding="utf-8",
+    )
+    registry = build_workspace_tool_registry(workspace)
+
+    result = registry.execute(
+        ToolCall(
+            call_id="call-pytest",
+            tool_name="run_pytest",
+            arguments={"target": "tests"},
+        )
+    )
+
+    assert result.is_error is False
+    assert "退出码: 0" in result.content

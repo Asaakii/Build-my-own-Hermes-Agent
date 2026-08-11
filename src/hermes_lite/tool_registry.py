@@ -29,6 +29,7 @@ class ToolRiskLevel(str, Enum):
     READ_ONLY = "read_only"
     WRITE = "write"
     DESTRUCTIVE = "destructive"
+    EXECUTE = "execute"
 
 
 def _require_text(value: object, field_name: str) -> str:

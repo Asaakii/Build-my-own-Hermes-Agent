@@ -9,6 +9,12 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from hermes_lite.domain import ToolCall
+from hermes_lite.test_runner import (
+    PytestExecutionError,
+    PytestPolicyError,
+    build_pytest_command,
+    execute_pytest,
+)
 from hermes_lite.tool_registry import (
     ToolDefinition,
     ToolExecutionError,
@@ -592,6 +598,17 @@ def search_text(workspace: Workspace, arguments: object) -> str:
     return result
 
 
+def run_pytest(workspace: Workspace, arguments: object) -> str:
+    """在受限工作区中执行固定参数的 Pytest。"""
+    try:
+        command = build_pytest_command(workspace, arguments)
+        result = execute_pytest(command)
+    except (PytestPolicyError, PytestExecutionError) as error:
+        raise ToolExecutionError(str(error)) from error
+
+    return result.to_text()
+
+
 def build_workspace_tool_registry(workspace: Workspace) -> ToolRegistry:
     """创建绑定到指定受限工作区的只读工具注册表。"""
     if not isinstance(workspace, Workspace):
@@ -618,6 +635,10 @@ def build_workspace_tool_registry(workspace: Workspace) -> ToolRegistry:
     def replace_text_once_handler(arguments: dict[str, object]) -> str:
         """调用精确文本替换工具。"""
         return replace_text_once(workspace, arguments)
+
+    def run_pytest_handler(arguments: dict[str, object]) -> str:
+        """调用受控 Pytest 工具。"""
+        return run_pytest(workspace, arguments)
 
     registry.register(
         ToolDefinition(
@@ -737,4 +758,30 @@ def build_workspace_tool_registry(workspace: Workspace) -> ToolRegistry:
             handler=replace_text_once_handler,
         )
     )
+    registry.register(
+        ToolDefinition(
+            name="run_pytest",
+            description=(
+                "在受限工作区中，以固定 python -m pytest -q "
+                "参数运行已有测试目标。仅适用于自有练习工作区。"
+            ),
+            parameters_schema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "工作区内已有的目录或 .py 测试文件；"
+                            "使用 . 表示工作区根目录。"
+                        ),
+                    },
+                },
+                "required": ["target"],
+                "additionalProperties": False,
+            },
+            risk_level=ToolRiskLevel.EXECUTE,
+            handler=run_pytest_handler,
+        )
+    )
+
     return registry
