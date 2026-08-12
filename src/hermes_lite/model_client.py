@@ -13,6 +13,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from hermes_lite.domain import Message, MessageRole, ToolCall
 from hermes_lite.retry_policy import RetryPolicy
+from hermes_lite.runtime_log import RuntimeEvent, emit_runtime_event
 from hermes_lite.config import (
     ConfigurationError,
     ModelConfig,
@@ -230,12 +231,9 @@ class ModelClient:
             request_options["tools"] = tools
             request_options["tool_choice"] = "auto"
 
-        logger.info(
-            "开始模型请求：provider=%s model=%s messages=%d tools=%d",
-            self._config.provider,
-            self._config.model,
-            len(request_messages),
-            len(tools or []),
+        emit_runtime_event(
+            logger,
+            RuntimeEvent.MODEL_REQUEST_STARTED,
         )
 
         attempts_made = 0
@@ -248,17 +246,26 @@ class ModelClient:
                     retryable=error.retryable,
                     attempts_made=attempts_made,
                 ):
+                    emit_runtime_event(
+                        logger,
+                        RuntimeEvent.MODEL_REQUEST_FAILED,
+                        error_kind=error.kind.value,
+                        attempt=attempts_made,
+                        max_attempts=self._retry_policy.max_attempts,
+                        level=logging.WARNING,
+                    )
                     raise
 
                 delay_seconds = self._retry_policy.delay_after_failure(
                     attempts_made,
                 )
-                logger.warning(
-                    "模型请求将重试：attempt=%d max_attempts=%d kind=%s delay_seconds=%.3f",
-                    attempts_made,
-                    self._retry_policy.max_attempts,
-                    error.kind.value,
-                    delay_seconds,
+                emit_runtime_event(
+                    logger,
+                    RuntimeEvent.MODEL_REQUEST_RETRY,
+                    error_kind=error.kind.value,
+                    attempt=attempts_made,
+                    max_attempts=self._retry_policy.max_attempts,
+                    level=logging.WARNING,
                 )
                 self._sleep(delay_seconds)
 
@@ -340,13 +347,22 @@ class ModelClient:
                 for message in message_list
             ]
         )
-        assistant_message = self._parse_assistant_message(completion)
+        try:
+            assistant_message = self._parse_assistant_message(completion)
 
-        if assistant_message.tool_calls:
-            raise ModelResponseError("纯文本请求不应返回工具调用")
+            if assistant_message.tool_calls:
+                raise ModelResponseError("纯文本请求不应返回工具调用")
+        except ModelResponseError as error:
+            emit_runtime_event(
+                logger,
+                RuntimeEvent.MODEL_REQUEST_FAILED,
+                error_kind=error.kind.value,
+                level=logging.WARNING,
+            )
+            raise
 
         assert isinstance(assistant_message.content, str)
-        logger.info("模型请求成功")
+        emit_runtime_event(logger, RuntimeEvent.MODEL_REQUEST_COMPLETED)
         return assistant_message.content
 
     def respond(
@@ -368,8 +384,18 @@ class ModelClient:
             ],
             tools=tool_list,
         )
-        assistant_message = self._parse_assistant_message(completion)
-        logger.info("工具感知模型请求成功")
+        try:
+            assistant_message = self._parse_assistant_message(completion)
+        except ModelResponseError as error:
+            emit_runtime_event(
+                logger,
+                RuntimeEvent.MODEL_REQUEST_FAILED,
+                error_kind=error.kind.value,
+                level=logging.WARNING,
+            )
+            raise
+
+        emit_runtime_event(logger, RuntimeEvent.MODEL_REQUEST_COMPLETED)
         return assistant_message
 
     def ask_text(self, system_prompt: str, user_prompt: str) -> str:

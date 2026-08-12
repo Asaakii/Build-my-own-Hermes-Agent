@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import logging
 from typing import Protocol
 from uuid import uuid4
 
@@ -41,6 +42,11 @@ from hermes_lite.prompt_builder import (
     PromptBuilder,
     PromptBuilderError,
 )
+from hermes_lite.runtime_log import (
+    RuntimeEvent,
+    emit_runtime_event,
+    task_log_context,
+)
 from hermes_lite.skill_loader import Skill, SkillLoadError, load_skill
 from hermes_lite.tool_registry import ToolRegistry, ToolRegistryError
 
@@ -53,6 +59,8 @@ DEFAULT_TOOL_SYSTEM_PROMPT = (
 DEFAULT_TOOL_WORKSPACE_RULES = (
     "工具只能访问已配置的受限工作区，不能绕过注册表或路径边界。"
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ToolConversationModel(Protocol):
@@ -313,6 +321,13 @@ class ToolAgent:
     ) -> ToolAgentTurn:
         """把失败状态统一转换为结构化运行结果。"""
         task.status = TaskStatus.FAILED
+        emit_runtime_event(
+            logger,
+            RuntimeEvent.TASK_FAILED,
+            task_id=task.task_id,
+            task_status=task.status.value,
+            level=logging.WARNING,
+        )
         return ToolAgentTurn(
             task=task,
             answer=None,
@@ -330,6 +345,13 @@ class ToolAgent:
     ) -> ToolAgentTurn:
         """将等待用户确认的调用保存为可恢复的受阻任务。"""
         task.status = TaskStatus.BLOCKED
+        emit_runtime_event(
+            logger,
+            RuntimeEvent.TASK_BLOCKED,
+            task_id=task.task_id,
+            task_status=task.status.value,
+            level=logging.WARNING,
+        )
         return ToolAgentTurn(
             task=task,
             answer=None,
@@ -393,6 +415,13 @@ class ToolAgent:
 
         task.tool_rounds = 1
         result = self._registry.execute(pending.tool_call)
+        emit_runtime_event(
+            logger,
+            RuntimeEvent.TOOL_FINISHED,
+            task_id=task.task_id,
+            tool_name=result.tool_name,
+            round_number=task.tool_rounds,
+        )
         tool_results.append(result)
         round_summaries.append(
             ToolRoundSummary(round_number=task.tool_rounds, results=(result,))
@@ -423,6 +452,12 @@ class ToolAgent:
         answer = f"已确认并执行工具: {result.tool_name}\n{result.content}"
         session.messages.append(Message(role=MessageRole.ASSISTANT, content=answer))
         task.status = TaskStatus.COMPLETED
+        emit_runtime_event(
+            logger,
+            RuntimeEvent.TASK_COMPLETED,
+            task_id=task.task_id,
+            task_status=task.status.value,
+        )
         return ToolAgentTurn(
             task=task,
             answer=answer,
@@ -454,6 +489,13 @@ class ToolAgent:
         )
         tool_results: list[ToolResult] = []
         round_summaries: list[ToolRoundSummary] = []
+
+        emit_runtime_event(
+            logger,
+            RuntimeEvent.TASK_STARTED,
+            task_id=task.task_id,
+            task_status=task.status.value,
+        )
 
         # 用户真实输入先写入会话；之后即使模型失败也不丢失。
         session.messages.append(user_message)
@@ -541,6 +583,12 @@ class ToolAgent:
                 Message(role=MessageRole.ASSISTANT, content=answer),
             )
             task.status = TaskStatus.COMPLETED
+            emit_runtime_event(
+                logger,
+                RuntimeEvent.TASK_COMPLETED,
+                task_id=task.task_id,
+                task_status=task.status.value,
+            )
             return ToolAgentTurn(
                 task=task,
                 answer=answer,
@@ -551,14 +599,15 @@ class ToolAgent:
 
         while True:
             try:
-                response = self._model.respond(
-                    self._build_model_messages(
-                        session,
+                with task_log_context(task.task_id):
+                    response = self._model.respond(
+                        self._build_model_messages(
+                            session,
+                            tool_definitions,
+                            selected_skill,
+                        ),
                         tool_definitions,
-                        selected_skill,
-                    ),
-                    tool_definitions,
-                )
+                    )
             except (ModelClientError, PromptBuilderError, MemoryStoreError) as error:
                 return self._failed_turn(
                     task,
@@ -588,6 +637,12 @@ class ToolAgent:
             if not response.tool_calls:
                 assert isinstance(response.content, str)
                 task.status = TaskStatus.COMPLETED
+                emit_runtime_event(
+                    logger,
+                    RuntimeEvent.TASK_COMPLETED,
+                    task_id=task.task_id,
+                    task_status=task.status.value,
+                )
                 return ToolAgentTurn(
                     task=task,
                     answer=response.content,
@@ -620,6 +675,14 @@ class ToolAgent:
                         round_summaries,
                         audit_error,
                     )
+
+                emit_runtime_event(
+                    logger,
+                    RuntimeEvent.TOOL_REQUESTED,
+                    task_id=task.task_id,
+                    tool_name=call.tool_name,
+                    round_number=task.tool_rounds,
+                )
 
                 if (
                     selected_skill is not None
@@ -708,6 +771,13 @@ class ToolAgent:
                         result,
                     )
                     if audit_error is not None:
+                        emit_runtime_event(
+                            logger,
+                            RuntimeEvent.TOOL_FINISHED,
+                            task_id=task.task_id,
+                            tool_name=result.tool_name,
+                            round_number=task.tool_rounds,
+                        )
                         tool_results.append(result)
                         current_round_results.append(result)
                         session.messages.append(Message.from_tool_result(result))
@@ -724,6 +794,13 @@ class ToolAgent:
                             audit_error,
                         )
 
+                emit_runtime_event(
+                    logger,
+                    RuntimeEvent.TOOL_FINISHED,
+                    task_id=task.task_id,
+                    tool_name=result.tool_name,
+                    round_number=task.tool_rounds,
+                )
                 tool_results.append(result)
                 current_round_results.append(result)
                 session.messages.append(Message.from_tool_result(result))

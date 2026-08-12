@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import logging
 from typing import Protocol
 from uuid import uuid4
 
@@ -20,6 +21,11 @@ from hermes_lite.memory_store import (
     parse_remember_command,
 )
 from hermes_lite.model_client import ModelClientError
+from hermes_lite.runtime_log import (
+    RuntimeEvent,
+    emit_runtime_event,
+    task_log_context,
+)
 from hermes_lite.prompt_builder import (
     HistorySummarizer,
     PromptBuilder,
@@ -35,6 +41,8 @@ DEFAULT_SYSTEM_PROMPT = (
 DEFAULT_TEXT_WORKSPACE_RULES = (
     "当前文本模式不提供工作区访问权限，也不能声称执行了文件操作。"
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ConversationModel(Protocol):
@@ -140,6 +148,13 @@ class TextAgent:
             status=TaskStatus.RUNNING,
         )
 
+        emit_runtime_event(
+            logger,
+            RuntimeEvent.TASK_STARTED,
+            task_id=task.task_id,
+            task_status=task.status.value,
+        )
+
         # 用户消息是真实输入，即使模型临时失败也应留在会话中。
         session.messages.append(user_message)
 
@@ -150,11 +165,25 @@ class TextAgent:
             )
         except MemoryStoreError as error:
             task.status = TaskStatus.FAILED
+            emit_runtime_event(
+                logger,
+                RuntimeEvent.TASK_FAILED,
+                task_id=task.task_id,
+                task_status=task.status.value,
+                level=logging.WARNING,
+            )
             return AgentTurn(task=task, answer=None, error_message=str(error))
 
         if remember_request is not None:
             if self._memory_store is None:
                 task.status = TaskStatus.FAILED
+                emit_runtime_event(
+                    logger,
+                    RuntimeEvent.TASK_FAILED,
+                    task_id=task.task_id,
+                    task_status=task.status.value,
+                    level=logging.WARNING,
+                )
                 return AgentTurn(
                     task=task,
                     answer=None,
@@ -165,6 +194,13 @@ class TextAgent:
                 save_result = self._memory_store.save_authorized(remember_request)
             except MemoryStoreError as error:
                 task.status = TaskStatus.FAILED
+                emit_runtime_event(
+                    logger,
+                    RuntimeEvent.TASK_FAILED,
+                    task_id=task.task_id,
+                    task_status=task.status.value,
+                    level=logging.WARNING,
+                )
                 return AgentTurn(task=task, answer=None, error_message=str(error))
 
             answer = (
@@ -176,14 +212,28 @@ class TextAgent:
                 Message(role=MessageRole.ASSISTANT, content=answer),
             )
             task.status = TaskStatus.COMPLETED
+            emit_runtime_event(
+                logger,
+                RuntimeEvent.TASK_COMPLETED,
+                task_id=task.task_id,
+                task_status=task.status.value,
+            )
             return AgentTurn(task=task, answer=answer, error_message=None)
 
         try:
-            answer = self._model.ask_messages(
-                self._build_model_messages(session),
-            )
+            with task_log_context(task.task_id):
+                answer = self._model.ask_messages(
+                    self._build_model_messages(session),
+                )
         except (ModelClientError, PromptBuilderError, MemoryStoreError) as error:
             task.status = TaskStatus.FAILED
+            emit_runtime_event(
+                logger,
+                RuntimeEvent.TASK_FAILED,
+                task_id=task.task_id,
+                task_status=task.status.value,
+                level=logging.WARNING,
+            )
             return AgentTurn(
                 task=task,
                 answer=None,
@@ -196,6 +246,12 @@ class TextAgent:
         )
         session.messages.append(assistant_message)
         task.status = TaskStatus.COMPLETED
+        emit_runtime_event(
+            logger,
+            RuntimeEvent.TASK_COMPLETED,
+            task_id=task.task_id,
+            task_status=task.status.value,
+        )
 
         return AgentTurn(
             task=task,
