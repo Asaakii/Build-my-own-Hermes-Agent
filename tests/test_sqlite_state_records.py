@@ -322,3 +322,40 @@ def test_restore_missing_session_has_no_skipped_records(
 
     assert restored.session is None
     assert restored.skipped_message_records == 0
+
+
+def test_save_task_state_persists_non_coding_task_without_report(
+    store: SQLiteStateStore,
+) -> None:
+    """普通聊天任务可持久化状态与工具观察，不需要伪造测试报告。"""
+    session = make_session()
+    store.save_session(session)
+    task = TaskState(
+        task_id="chat-task-1",
+        session_id=session.session_id,
+        user_request="普通聊天任务",
+        status=TaskStatus.COMPLETED,
+        tool_rounds=0,
+    )
+
+    store.save_task_state(task, ())
+
+    stored = store.load_coding_task("chat-task-1")
+    assert stored is not None
+    assert stored.task == task
+    assert stored.report is None
+
+
+def test_save_task_state_rejects_unsaved_session(
+    store: SQLiteStateStore,
+) -> None:
+    """通用任务状态仍必须属于已经保存的会话。"""
+    task = TaskState(
+        task_id="chat-task-2",
+        session_id="missing-session",
+        user_request="普通聊天任务",
+        status=TaskStatus.FAILED,
+    )
+
+    with pytest.raises(SQLiteStateStoreError, match="会话尚未保存"):
+        store.save_task_state(task, ())

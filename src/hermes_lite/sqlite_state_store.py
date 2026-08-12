@@ -586,6 +586,90 @@ class SQLiteStateStore:
         """按会话标识恢复消息历史，不存在时返回 None。"""
         return self.restore_session(session_id).session
 
+    def save_task_state(
+        self,
+        task: TaskState,
+        rounds: tuple[ToolRoundSummary, ...],
+    ) -> None:
+        """保存通用任务状态与真实工具观察，不要求编码测试报告。"""
+        if not isinstance(task, TaskState):
+            raise SQLiteStateStoreError("task 必须是 TaskState")
+
+        if not isinstance(rounds, tuple) or not all(
+            isinstance(round_, ToolRoundSummary) for round_ in rounds
+        ):
+            raise SQLiteStateStoreError("rounds 必须是 ToolRoundSummary 元组")
+
+        self.initialize()
+        connection: sqlite3.Connection | None = None
+
+        try:
+            connection = self._connect()
+            now = _utc_now_text()
+
+            with connection:
+                session_row = connection.execute(
+                    "SELECT session_id FROM sessions WHERE session_id = ?",
+                    (task.session_id,),
+                ).fetchone()
+                if session_row is None:
+                    raise SQLiteStateStoreError("任务所属会话尚未保存")
+
+                connection.execute(
+                    "INSERT INTO tasks "
+                    "(task_id, session_id, user_request, status, tool_rounds, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(task_id) DO UPDATE SET "
+                    "session_id = excluded.session_id, "
+                    "user_request = excluded.user_request, "
+                    "status = excluded.status, "
+                    "tool_rounds = excluded.tool_rounds, "
+                    "updated_at = excluded.updated_at",
+                    (
+                        task.task_id,
+                        task.session_id,
+                        task.user_request,
+                        task.status.value,
+                        task.tool_rounds,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM tool_results WHERE task_id = ?",
+                    (task.task_id,),
+                )
+                connection.execute(
+                    "DELETE FROM task_reports WHERE task_id = ?",
+                    (task.task_id,),
+                )
+
+                result_rows = [
+                    (
+                        task.task_id,
+                        summary.round_number,
+                        result_index,
+                        result.call_id,
+                        result.tool_name,
+                        result.content,
+                        int(result.is_error),
+                    )
+                    for summary in rounds
+                    for result_index, result in enumerate(summary.results)
+                ]
+                if result_rows:
+                    connection.executemany(
+                        "INSERT INTO tool_results "
+                        "(task_id, round_number, result_sequence, call_id, "
+                        "tool_name, content, is_error) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        result_rows,
+                    )
+        except sqlite3.Error as error:
+            raise SQLiteStateStoreError("无法保存任务记录") from error
+        finally:
+            if connection is not None:
+                connection.close()
+
     def save_coding_task(
         self,
         task: TaskState,

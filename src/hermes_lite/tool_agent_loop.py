@@ -481,10 +481,16 @@ class ToolAgent:
             role=MessageRole.USER,
             content=user_request,
         )
+        command_name = user_message.content.split(maxsplit=1)[0]
+        is_confirmation_command = command_name == "/confirm"
         task = TaskState(
             task_id=task_id or f"task-{uuid4().hex}",
             session_id=session.session_id,
-            user_request=user_message.content,
+            user_request=(
+                "确认命令（令牌已隐藏）"
+                if is_confirmation_command
+                else user_message.content
+            ),
             status=TaskStatus.RUNNING,
         )
         tool_results: list[ToolResult] = []
@@ -497,8 +503,9 @@ class ToolAgent:
             task_status=task.status.value,
         )
 
-        # 用户真实输入先写入会话；之后即使模型失败也不丢失。
-        session.messages.append(user_message)
+        # 确认令牌只能存活于进程内，不能进入会话历史或任务记录。
+        if not is_confirmation_command:
+            session.messages.append(user_message)
 
         try:
             confirmation_token = parse_confirmation_command(
@@ -744,7 +751,7 @@ class ToolAgent:
                         tool_name=call.tool_name,
                         content=(
                             f"工具调用等待确认: {call.tool_name}。"
-                            f"请发送 /confirm {pending.token} 后执行。"
+                            "请在当前交互会话中使用确认命令继续。"
                         ),
                         is_error=True,
                     )

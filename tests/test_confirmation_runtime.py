@@ -109,10 +109,13 @@ def test_high_risk_call_blocks_before_execution_then_confirm_executes() -> None:
         MessageRole.USER,
         MessageRole.ASSISTANT,
         MessageRole.TOOL,
-        MessageRole.USER,
         MessageRole.TOOL,
         MessageRole.ASSISTANT,
     ]
+    assert all(
+        "confirm-write" not in (message.content or "")
+        for message in session.messages
+    )
 
 
 def test_confirmation_cannot_be_consumed_by_another_session() -> None:
