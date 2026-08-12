@@ -27,6 +27,7 @@ from hermes_lite.prompt_builder import (
     PromptBuilder,
     PromptBuilderError,
 )
+from hermes_lite.skill_loader import Skill, SkillLoadError, load_skill
 from hermes_lite.tool_registry import ToolRegistry
 
 
@@ -156,12 +157,26 @@ class ToolAgent:
             for memory in self._memory_store.list_memories()
         )
 
-    def _build_model_messages(self, session: Session) -> tuple[Message, ...]:
-        """构建含工具定义和受限历史的模型上下文。"""
+    def _build_model_messages(
+        self,
+        session: Session,
+        tool_definitions: Sequence[dict[str, object]],
+        selected_skill: Skill | None,
+    ) -> tuple[Message, ...]:
+        """构建含受限工具、显式技能和历史的模型上下文。"""
+        skills = ()
+        if selected_skill is not None:
+            skills = (
+                f"技能名称：{selected_skill.name}\n"
+                f"技能说明：{selected_skill.description}\n"
+                f"技能步骤：\n{selected_skill.instructions}",
+            )
+
         return self._prompt_builder.build(
             safety_rules=self._system_message.content,
             workspace_rules=DEFAULT_TOOL_WORKSPACE_RULES,
-            tool_definitions=self._registry.list_model_definitions(),
+            tool_definitions=tool_definitions,
+            skills=skills,
             long_term_memories=self._long_term_memory_contents(),
             history=session.messages,
             summarizer=self._history_summarizer,
@@ -189,8 +204,12 @@ class ToolAgent:
         session: Session,
         user_request: str,
         task_id: str | None = None,
+        skill_name: object | None = None,
     ) -> ToolAgentTurn:
-        """执行一轮用户请求，以及其内部有限次工具循环。"""
+        """执行一轮用户请求，以及其内部有限次工具循环。
+
+        只有调用方显式提供 skill_name 时才加载技能；默认仍可使用完整注册表。
+        """
         user_message = Message(
             role=MessageRole.USER,
             content=user_request,
@@ -206,6 +225,25 @@ class ToolAgent:
 
         # 用户真实输入先写入会话；之后即使模型失败也不丢失。
         session.messages.append(user_message)
+
+        try:
+            selected_skill = (
+                load_skill(skill_name)
+                if skill_name is not None
+                else None
+            )
+            tool_definitions = (
+                selected_skill.allowed_tool_definitions(self._registry)
+                if selected_skill is not None
+                else self._registry.list_model_definitions()
+            )
+        except SkillLoadError as error:
+            return self._failed_turn(
+                task,
+                tool_results,
+                round_summaries,
+                str(error),
+            )
 
         try:
             remember_request = parse_remember_command(
@@ -259,8 +297,12 @@ class ToolAgent:
         while True:
             try:
                 response = self._model.respond(
-                    self._build_model_messages(session),
-                    self._registry.list_model_definitions(),
+                    self._build_model_messages(
+                        session,
+                        tool_definitions,
+                        selected_skill,
+                    ),
+                    tool_definitions,
                 )
             except (ModelClientError, PromptBuilderError, MemoryStoreError) as error:
                 return self._failed_turn(
@@ -311,7 +353,22 @@ class ToolAgent:
             current_round_results: list[ToolResult] = []
 
             for call in response.tool_calls:
-                result = self._registry.execute(call)
+                if (
+                    selected_skill is not None
+                    and call.tool_name not in selected_skill.allowed_tools
+                ):
+                    # 即使模型伪造了未暴露工具，也不把它交给注册表执行。
+                    result = ToolResult(
+                        call_id=call.call_id,
+                        tool_name=call.tool_name,
+                        content=(
+                            "工具调用被拒绝：当前技能不允许工具 "
+                            f"{call.tool_name}"
+                        ),
+                        is_error=True,
+                    )
+                else:
+                    result = self._registry.execute(call)
                 tool_results.append(result)
                 current_round_results.append(result)
                 session.messages.append(Message.from_tool_result(result))
