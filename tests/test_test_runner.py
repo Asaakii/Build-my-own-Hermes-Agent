@@ -220,3 +220,40 @@ def test_execute_pytest_runs_self_authored_workspace_test(
     assert result.returncode == 0
     assert result.timed_out is False
     assert "1 passed" in result.output
+
+
+def test_execute_pytest_clears_same_second_bytecode_cache(
+    workspace: Workspace,
+) -> None:
+    """同秒且等长修复后，复测不能继续读取旧的 Python 字节码。"""
+    (workspace.root / "calculator.py").write_text(
+        "def add(left: int, right: int) -> int:\n"
+        "    return left - right\n",
+        encoding="utf-8",
+    )
+    tests_directory = workspace.root / "tests"
+    tests_directory.mkdir()
+    (tests_directory / "test_calculator.py").write_text(
+        "from pathlib import Path\n"
+        "import sys\n\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n"
+        "from calculator import add\n\n"
+        "def test_add() -> None:\n"
+        "    assert add(2, 3) == 5\n",
+        encoding="utf-8",
+    )
+    command = build_pytest_command(
+        workspace,
+        {"target": "tests/test_calculator.py"},
+    )
+
+    first_result = execute_pytest(command)
+    (workspace.root / "calculator.py").write_text(
+        "def add(left: int, right: int) -> int:\n"
+        "    return left + right\n",
+        encoding="utf-8",
+    )
+    second_result = execute_pytest(command)
+
+    assert first_result.returncode == 1
+    assert second_result.returncode == 0

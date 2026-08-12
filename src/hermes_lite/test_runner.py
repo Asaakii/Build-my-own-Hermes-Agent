@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import subprocess
 import sys
 
@@ -212,6 +213,52 @@ def _truncate_returned_output(output: str, max_characters: int) -> str:
     return output[:max_characters] + "\n[输出已截断]"
 
 
+
+def _clear_workspace_bytecode_cache(workspace_root: Path) -> None:
+    """清理工作区内旧的 `.pyc`，避免同秒修复仍复用旧字节码。"""
+    root = workspace_root.resolve()
+
+    try:
+        for current_directory, directory_names, _ in os.walk(
+            root,
+            topdown=True,
+            followlinks=False,
+        ):
+            current_path = Path(current_directory)
+            safe_directory_names: list[str] = []
+
+            for directory_name in directory_names:
+                candidate = current_path / directory_name
+
+                if directory_name != "__pycache__":
+                    safe_directory_names.append(directory_name)
+                    continue
+
+                try:
+                    resolved_candidate = candidate.resolve(strict=True)
+                    resolved_candidate.relative_to(root)
+                except (OSError, ValueError) as error:
+                    raise PytestExecutionError(
+                        "无法安全清理工作区字节码缓存",
+                    ) from error
+
+                if candidate.is_symlink() or not candidate.is_dir():
+                    raise PytestExecutionError(
+                        "无法安全清理工作区字节码缓存",
+                    )
+
+                for cached_file in candidate.iterdir():
+                    if cached_file.is_symlink() or not cached_file.is_file():
+                        continue
+
+                    if cached_file.suffix == ".pyc":
+                        cached_file.unlink()
+
+            # 不需要进入已经清理过的缓存目录。
+            directory_names[:] = safe_directory_names
+    except OSError as error:
+        raise PytestExecutionError("无法清理工作区字节码缓存") from error
+
 def execute_pytest(
     command: PytestCommand,
     *,
@@ -231,6 +278,7 @@ def execute_pytest(
         max_output_characters,
         "max_output_characters",
     )
+    _clear_workspace_bytecode_cache(command.cwd)
 
     try:
         completed = runner(
