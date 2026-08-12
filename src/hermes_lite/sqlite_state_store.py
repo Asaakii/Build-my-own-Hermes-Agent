@@ -31,7 +31,7 @@ from hermes_lite.domain import (
 
 
 DEFAULT_STATE_DB_RELATIVE_PATH = Path("data") / "hermes_lite.sqlite3"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class SQLiteStateStoreError(ValueError):
@@ -216,6 +216,22 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 CREATE INDEX IF NOT EXISTS audit_events_session_event_idx
 ON audit_events (session_id, event_id);
+
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    task_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    message TEXT NOT NULL,
+    due_at TEXT NOT NULL,
+    status TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    source_task_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL
+);
 """
 
 

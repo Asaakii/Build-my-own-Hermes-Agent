@@ -23,12 +23,22 @@ from hermes_lite.config import (
     load_model_config,
 )
 from hermes_lite.doctor import DoctorReport, format_doctor_report, run_doctor
+from hermes_lite.gateway import (
+    GatewayError,
+    GatewayService,
+    TelegramChannel,
+    TelegramHttpApi,
+    load_gateway_config,
+    load_telegram_config,
+    run_gateway_http_server,
+)
 from hermes_lite.domain import TaskStatus
 from hermes_lite.memory_store import (
     LongTermMemory,
     MemoryStoreError,
     SQLiteMemoryStore,
 )
+from hermes_lite.scheduler import SchedulerError, SchedulerStore
 from hermes_lite.skill_loader import (
     Skill,
     SkillLoadError,
@@ -175,6 +185,31 @@ def build_parser() -> CliArgumentParser:
         required=True,
     )
     skills_subparsers.add_parser("list", help="列出可用技能。")
+
+    gateway_parser = subparsers.add_parser("gateway", help="运行仅本机可访问的 HTTP Gateway。")
+    gateway_subparsers = gateway_parser.add_subparsers(dest="gateway_command", required=True)
+    gateway_subparsers.add_parser("run", help="启动 127.0.0.1 Gateway；按 Ctrl+C 停止。")
+
+    telegram_parser = subparsers.add_parser("telegram", help="运行 Telegram 私聊长轮询渠道。")
+    telegram_subparsers = telegram_parser.add_subparsers(dest="telegram_command", required=True)
+    telegram_subparsers.add_parser("run", help="启动 Telegram 渠道；按 Ctrl+C 停止。")
+
+    schedule_parser = subparsers.add_parser("schedule", help="管理可审查的本地计划提醒。")
+    schedule_subparsers = schedule_parser.add_subparsers(dest="schedule_command", required=True)
+    schedule_create = schedule_subparsers.add_parser("create", help="创建延迟提醒。")
+    schedule_create.add_argument("--session-id", type=_session_id, default="local-default")
+    schedule_create.add_argument("delay_seconds", type=_positive_integer)
+    schedule_create.add_argument("message")
+    schedule_subparsers.add_parser("list", help="列出计划任务。")
+    schedule_cancel = schedule_subparsers.add_parser("cancel", help="取消待执行任务。")
+    schedule_cancel.add_argument("task_id")
+    schedule_subparsers.add_parser("run", help="投递当前已到期任务并生成候选复盘。")
+
+    review_parser = subparsers.add_parser("review", help="查看或人工审批计划任务的候选复盘。")
+    review_subparsers = review_parser.add_subparsers(dest="review_command", required=True)
+    review_subparsers.add_parser("list", help="列出候选复盘。")
+    review_approve = review_subparsers.add_parser("approve-memory", help="明确审批候选并保存为长期记忆。")
+    review_approve.add_argument("candidate_id")
 
     return parser
 
@@ -354,6 +389,89 @@ def _run_skills_list() -> int:
     return 0
 
 
+def _run_gateway() -> int:
+    """启动带令牌校验的本机回环 Gateway。"""
+    config = load_gateway_config()
+    print(f"Gateway 已启动：http://{config.host}:{config.port}")
+    print("按 Ctrl+C 停止。")
+    try:
+        run_gateway_http_server(config, GatewayService(build_local_chat_runtime()))
+    except KeyboardInterrupt:
+        print("Gateway 已停止。")
+    return 0
+
+
+def _run_telegram() -> int:
+    """启动仅接受白名单私聊文本的 Telegram 长轮询。"""
+    config = load_telegram_config()
+    channel = TelegramChannel(
+        config,
+        TelegramHttpApi(config),
+        GatewayService(build_local_chat_runtime()),
+    )
+    print("Telegram 渠道已启动。按 Ctrl+C 停止。")
+    try:
+        while True:
+            channel.poll_once()
+    except KeyboardInterrupt:
+        print("Telegram 渠道已停止。")
+    return 0
+
+
+def _scheduler_store() -> SchedulerStore:
+    """复用唯一状态库创建计划任务服务。"""
+    return SchedulerStore(_load_state_store())
+
+
+def _run_schedule_create(session_id: str, delay_seconds: int, message: str) -> int:
+    task = _scheduler_store().create(session_id, message, delay_seconds)
+    print(f"提醒已创建：{task.task_id}")
+    print(f"到期时间：{task.due_at}")
+    return 0
+
+
+def _run_schedule_list() -> int:
+    tasks = _scheduler_store().list()
+    if not tasks:
+        print("没有计划任务。")
+        return 0
+    for task in tasks:
+        print(f"{task.task_id} | {task.status} | {task.due_at} | {task.message}")
+    return 0
+
+
+def _run_schedule_cancel(task_id: str) -> int:
+    if not _scheduler_store().cancel(task_id):
+        print("待执行任务不存在。", file=sys.stderr)
+        return 1
+    print("计划任务已取消。")
+    return 0
+
+
+def _run_schedule_due() -> int:
+    delivered = _scheduler_store().run_due(lambda task: print(f"提醒：{task.message}"))
+    print(f"已投递 {len(delivered)} 个到期任务；候选复盘等待人工审批。")
+    return 0
+
+
+def _run_review_list() -> int:
+    candidates = _scheduler_store().list_candidates()
+    if not candidates:
+        print("没有候选复盘。")
+        return 0
+    for candidate in candidates:
+        print(f"{candidate.candidate_id} | {candidate.kind} | {candidate.status} | {candidate.content}")
+    return 0
+
+
+def _run_review_approve_memory(candidate_id: str) -> int:
+    if not _scheduler_store().approve_memory_candidate(candidate_id):
+        print("候选不存在、已审批或不是记忆候选。", file=sys.stderr)
+        return 1
+    print("候选已明确审批并保存为长期记忆。")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """解析命令并返回稳定退出码，便于脚本和自动化测试调用。"""
     parser = build_parser()
@@ -384,12 +502,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_memory_search(arguments.query, arguments.limit)
         if arguments.command == "skills":
             return _run_skills_list()
+        if arguments.command == "gateway":
+            return _run_gateway()
+        if arguments.command == "telegram":
+            return _run_telegram()
+        if arguments.command == "schedule":
+            if arguments.schedule_command == "create":
+                return _run_schedule_create(arguments.session_id, arguments.delay_seconds, arguments.message)
+            if arguments.schedule_command == "list":
+                return _run_schedule_list()
+            if arguments.schedule_command == "cancel":
+                return _run_schedule_cancel(arguments.task_id)
+            return _run_schedule_due()
+        if arguments.command == "review":
+            if arguments.review_command == "list":
+                return _run_review_list()
+            return _run_review_approve_memory(arguments.candidate_id)
     except (
         ConfigurationError,
         MemoryStoreError,
         SkillLoadError,
         SQLiteStateStoreError,
         WorkspaceError,
+        GatewayError,
+        SchedulerError,
     ):
         print("命令执行失败，请检查本地配置或数据。", file=sys.stderr)
         return 1

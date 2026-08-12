@@ -14,13 +14,14 @@ from hermes_lite.doctor import (
     run_doctor,
 )
 from hermes_lite.model_client import ModelClientError
+from hermes_lite.sqlite_state_store import SCHEMA_VERSION
 
 
 @dataclass
 class StateStoreStub:
     """提供固定模式版本，避免诊断测试写入真实数据库。"""
 
-    schema_value: int = 3
+    schema_value: int = SCHEMA_VERSION
 
     def read_schema_version(self) -> int:
         """返回已验证的模式版本。"""
