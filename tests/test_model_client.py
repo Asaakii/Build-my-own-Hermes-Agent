@@ -9,9 +9,11 @@ from openai import APIStatusError
 from hermes_lite.domain import Message, MessageRole
 
 from hermes_lite.config import ConfigurationError, ModelConfig
+from hermes_lite.retry_policy import RetryPolicy
 from hermes_lite.model_client import (
     ModelClient,
     ModelClientError,
+    ModelErrorKind,
     ModelResponseError,
     ModelServiceError,
     ModelTimeoutError,
@@ -459,3 +461,150 @@ def test_ask_messages_rejects_unexpected_tool_call_response() -> None:
         client.ask_messages(
             [Message(role=MessageRole.USER, content="普通文本问题")]
         )
+
+
+class SequencedCompletions:
+    """按顺序返回结果或异常，用于验证有限重试次数。"""
+
+    def __init__(self, outcomes: list[object]) -> None:
+        self._outcomes = outcomes
+        self.requests: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> object:
+        """记录请求，并消费下一项预设结果。"""
+        self.requests.append(kwargs)
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class SequencedOpenAIClient:
+    """提供顺序化的 chat.completions 测试替身。"""
+
+    def __init__(self, outcomes: list[object]) -> None:
+        self.completions = SequencedCompletions(outcomes)
+        self.chat = SimpleNamespace(completions=self.completions)
+
+
+def make_status_error(status_code: int) -> APIStatusError:
+    """构造不含真实服务数据的 HTTP 状态异常。"""
+    return APIStatusError(
+        "request failed",
+        response=httpx.Response(
+            status_code=status_code,
+            request=httpx.Request(
+                "POST",
+                "https://api.example.com/chat/completions",
+            ),
+        ),
+        body={"error": "sanitized"},
+    )
+
+
+def test_model_client_retries_timeout_then_returns_answer() -> None:
+    """超时属于暂时错误，客户端按退避策略重试后可成功返回。"""
+    fake_client = SequencedOpenAIClient(
+        [
+            TimeoutError("temporary timeout"),
+            TimeoutError("temporary timeout"),
+            make_completion("重试成功"),
+        ]
+    )
+    wait_calls: list[float] = []
+    client = ModelClient(
+        make_config(),
+        client=fake_client,
+        retry_policy=RetryPolicy(
+            max_attempts=3,
+            initial_delay_seconds=0.1,
+            max_delay_seconds=0.5,
+        ),
+        sleep=wait_calls.append,
+    )
+
+    answer = client.ask_text("系统提示", "用户问题")
+
+    assert answer == "重试成功"
+    assert len(fake_client.completions.requests) == 3
+    assert wait_calls == [0.1, 0.2]
+
+
+def test_model_client_stops_after_retry_limit() -> None:
+    """持续超时达到总次数上限后，应返回最后一次标准错误。"""
+    fake_client = SequencedOpenAIClient(
+        [
+            TimeoutError("temporary timeout"),
+            TimeoutError("temporary timeout"),
+            TimeoutError("temporary timeout"),
+        ]
+    )
+    wait_calls: list[float] = []
+    client = ModelClient(
+        make_config(),
+        client=fake_client,
+        retry_policy=RetryPolicy(
+            max_attempts=3,
+            initial_delay_seconds=0.1,
+            max_delay_seconds=0.5,
+        ),
+        sleep=wait_calls.append,
+    )
+
+    with pytest.raises(ModelTimeoutError) as error_info:
+        client.ask_text("系统提示", "用户问题")
+
+    assert error_info.value.kind is ModelErrorKind.TIMEOUT
+    assert error_info.value.retryable is True
+    assert len(fake_client.completions.requests) == 3
+    assert wait_calls == [0.1, 0.2]
+
+
+def test_model_client_does_not_retry_authentication_error() -> None:
+    """认证失败不是暂时错误，必须立即停止以避免重复无效请求。"""
+    fake_client = SequencedOpenAIClient([make_status_error(401)])
+    wait_calls: list[float] = []
+    client = ModelClient(
+        make_config(),
+        client=fake_client,
+        retry_policy=RetryPolicy(max_attempts=3),
+        sleep=wait_calls.append,
+    )
+
+    with pytest.raises(ModelServiceError) as error_info:
+        client.ask_text("系统提示", "用户问题")
+
+    assert error_info.value.kind is ModelErrorKind.AUTHENTICATION
+    assert error_info.value.retryable is False
+    assert len(fake_client.completions.requests) == 1
+    assert wait_calls == []
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_kind", "expected_retryable"),
+    [
+        (429, ModelErrorKind.RATE_LIMIT, True),
+        (503, ModelErrorKind.SERVICE, True),
+        (400, ModelErrorKind.REQUEST, False),
+    ],
+)
+def test_model_client_classifies_status_errors(
+    status_code: int,
+    expected_kind: ModelErrorKind,
+    expected_retryable: bool,
+) -> None:
+    """状态码应映射为稳定类别，并明确是否可重试。"""
+    fake_client = SequencedOpenAIClient([make_status_error(status_code)])
+    client = ModelClient(
+        make_config(),
+        client=fake_client,
+        retry_policy=RetryPolicy(max_attempts=1),
+        sleep=lambda delay: None,
+    )
+
+    with pytest.raises(ModelServiceError) as error_info:
+        client.ask_text("系统提示", "用户问题")
+
+    assert error_info.value.kind is expected_kind
+    assert error_info.value.retryable is expected_retryable
+    assert len(fake_client.completions.requests) == 1

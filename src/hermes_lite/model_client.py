@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from enum import Enum
+from collections.abc import Callable, Sequence
 import logging
+import time
 from typing import Any
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from hermes_lite.domain import Message, MessageRole, ToolCall
+from hermes_lite.retry_policy import RetryPolicy
 from hermes_lite.config import (
     ConfigurationError,
     ModelConfig,
@@ -19,20 +22,73 @@ from hermes_lite.config import (
 logger = logging.getLogger(__name__)
 
 
+class ModelErrorKind(str, Enum):
+    """模型请求失败的稳定分类，不包含 SDK 原始细节。"""
+
+    TIMEOUT = "timeout"
+    CONNECTION = "connection"
+    RATE_LIMIT = "rate_limit"
+    SERVICE = "service"
+    AUTHENTICATION = "authentication"
+    REQUEST = "request"
+    RESPONSE = "response"
+    UNKNOWN = "unknown"
+
+
 class ModelClientError(RuntimeError):
     """表示模型请求无法获得可用回答。"""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: ModelErrorKind = ModelErrorKind.UNKNOWN,
+        retryable: bool = False,
+    ) -> None:
+        """保存对用户安全的消息、稳定类别和是否允许重试。"""
+        super().__init__(message)
+        if not isinstance(kind, ModelErrorKind):
+            raise ValueError("kind 必须是 ModelErrorKind")
+        if not isinstance(retryable, bool):
+            raise ValueError("retryable 必须是布尔值")
+
+        self.kind = kind
+        self.retryable = retryable
+
 
 class ModelTimeoutError(ModelClientError):
-    """表示模型服务在指定时间内没有响应。"""
+    """表示模型服务在指定时间内没有响应，可有限重试。"""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            kind=ModelErrorKind.TIMEOUT,
+            retryable=True,
+        )
 
 
 class ModelServiceError(ModelClientError):
     """表示模型服务或网络连接出现问题。"""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: ModelErrorKind = ModelErrorKind.SERVICE,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message, kind=kind, retryable=retryable)
+
 
 class ModelResponseError(ModelClientError):
-    """表示模型返回结构不完整或没有有效文本。"""
+    """表示模型返回结构不完整或没有有效文本，不应重试。"""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            kind=ModelErrorKind.RESPONSE,
+            retryable=False,
+        )
 
 
 def _require_prompt(value: object, field_name: str) -> str:
@@ -54,14 +110,23 @@ class ModelClient:
         self,
         config: ModelConfig,
         client: Any | None = None,
+        retry_policy: RetryPolicy | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
-        """保存已验证配置，并允许测试注入假的 SDK 客户端。"""
+        """保存模型依赖、有限重试策略和可替换等待函数。"""
+        if retry_policy is not None and not isinstance(retry_policy, RetryPolicy):
+            raise ValueError("retry_policy 必须是 RetryPolicy 或 None")
+        if sleep is not None and not callable(sleep):
+            raise ValueError("sleep 必须是可调用对象或 None")
+
         self._config = config
         self._client = client if client is not None else OpenAI(
             api_key=config.api_key,
             base_url=config.base_url,
             timeout=config.timeout_seconds,
         )
+        self._retry_policy = retry_policy or RetryPolicy()
+        self._sleep = sleep or time.sleep
 
     def _coerce_messages(
         self,
@@ -111,12 +176,50 @@ class ModelClient:
         return request_message
 
 
+    def _request_once(
+        self,
+        request_options: dict[str, object],
+    ) -> object:
+        """发送一次请求，并把 SDK 异常转换为带重试属性的项目错误。"""
+        try:
+            return self._client.chat.completions.create(**request_options)
+        except (APITimeoutError, TimeoutError) as error:
+            raise ModelTimeoutError("模型请求超时，请稍后再试") from error
+        except (APIConnectionError, ConnectionError) as error:
+            raise ModelServiceError(
+                "无法连接模型服务，请检查网络",
+                kind=ModelErrorKind.CONNECTION,
+                retryable=True,
+            ) from error
+        except APIStatusError as error:
+            status_code = error.status_code
+            if status_code == 429:
+                kind = ModelErrorKind.RATE_LIMIT
+                retryable = True
+            elif isinstance(status_code, int) and 500 <= status_code <= 599:
+                kind = ModelErrorKind.SERVICE
+                retryable = True
+            elif status_code in {401, 403}:
+                kind = ModelErrorKind.AUTHENTICATION
+                retryable = False
+            else:
+                kind = ModelErrorKind.REQUEST
+                retryable = False
+
+            raise ModelServiceError(
+                f"模型服务返回错误状态码: {status_code}",
+                kind=kind,
+                retryable=retryable,
+            ) from error
+        except Exception as error:
+            raise ModelClientError("模型请求失败，请稍后再试") from error
+
     def _request_completion(
         self,
         request_messages: list[dict[str, object]],
         tools: list[dict[str, object]] | None = None,
     ) -> object:
-        """统一发送模型请求，并转换 SDK 层异常。"""
+        """发送有限次模型请求，只对标记为暂时性的失败退避重试。"""
         request_options: dict[str, object] = {
             "model": self._config.model,
             "messages": request_messages,
@@ -135,19 +238,29 @@ class ModelClient:
             len(tools or []),
         )
 
-        try:
-            return self._client.chat.completions.create(**request_options)
-        except (APITimeoutError, TimeoutError) as error:
-            raise ModelTimeoutError("模型请求超时，请稍后再试") from error
-        except (APIConnectionError, ConnectionError) as error:
-            raise ModelServiceError("无法连接模型服务，请检查网络") from error
-        except APIStatusError as error:
-            raise ModelServiceError(
-                f"模型服务返回错误状态码: {error.status_code}",
-            ) from error
-        except Exception as error:
-            raise ModelClientError("模型请求失败，请稍后再试") from error
+        attempts_made = 0
+        while True:
+            attempts_made += 1
+            try:
+                return self._request_once(request_options)
+            except ModelClientError as error:
+                if not self._retry_policy.should_retry(
+                    retryable=error.retryable,
+                    attempts_made=attempts_made,
+                ):
+                    raise
 
+                delay_seconds = self._retry_policy.delay_after_failure(
+                    attempts_made,
+                )
+                logger.warning(
+                    "模型请求将重试：attempt=%d max_attempts=%d kind=%s delay_seconds=%.3f",
+                    attempts_made,
+                    self._retry_policy.max_attempts,
+                    error.kind.value,
+                    delay_seconds,
+                )
+                self._sleep(delay_seconds)
 
     def _parse_assistant_message(self, completion: object) -> Message:
         """将 OpenAI 兼容响应转换为领域层助手消息。"""
