@@ -8,11 +8,19 @@ from typing import Protocol
 from uuid import uuid4
 
 from hermes_lite.coding_task import ToolRoundSummary
+from hermes_lite.confirmation_policy import (
+    ConfirmationManager,
+    ConfirmationPolicyError,
+    PendingConfirmation,
+    parse_confirmation_command,
+    requires_confirmation,
+)
 from hermes_lite.domain import (
     Message,
     MessageRole,
     Session,
     TaskState,
+    ToolCall,
     TaskStatus,
     ToolResult,
 )
@@ -28,12 +36,12 @@ from hermes_lite.prompt_builder import (
     PromptBuilderError,
 )
 from hermes_lite.skill_loader import Skill, SkillLoadError, load_skill
-from hermes_lite.tool_registry import ToolRegistry
+from hermes_lite.tool_registry import ToolRegistry, ToolRegistryError
 
 
 DEFAULT_TOOL_SYSTEM_PROMPT = (
     "你是 HermesLite。需要外部观察时，只能请求已提供的工具；"
-    "收到工具结果后继续判断；完成后返回简洁文本回答。"
+    "收到工具结果后继续判断；完成后返回简洁文本回答。高风险工具必须等待程序收到用户确认。"
 )
 
 DEFAULT_TOOL_WORKSPACE_RULES = (
@@ -61,6 +69,7 @@ class ToolAgentTurn:
     error_message: str | None
     tool_results: tuple[ToolResult, ...]
     round_summaries: tuple[ToolRoundSummary, ...]
+    pending_confirmation: PendingConfirmation | None = None
 
     def __post_init__(self) -> None:
         """验证成功或失败状态与工具结果摘要一致。"""
@@ -85,6 +94,12 @@ class ToolAgentTurn:
         if summarized_results != self.tool_results:
             raise ValueError("round_summaries 必须完整保留工具结果顺序")
 
+        if (
+            self.pending_confirmation is not None
+            and not isinstance(self.pending_confirmation, PendingConfirmation)
+        ):
+            raise ValueError("pending_confirmation 必须是 PendingConfirmation 或 None")
+
         if self.task.status is TaskStatus.COMPLETED:
             if not isinstance(self.answer, str) or not self.answer:
                 raise ValueError("已完成任务必须包含回答")
@@ -92,12 +107,28 @@ class ToolAgentTurn:
             if self.error_message is not None:
                 raise ValueError("已完成任务不能包含错误信息")
 
+            if self.pending_confirmation is not None:
+                raise ValueError("已完成任务不能保留待确认操作")
+
         if self.task.status is TaskStatus.FAILED:
             if self.answer is not None:
                 raise ValueError("失败任务不能包含回答")
 
             if not isinstance(self.error_message, str) or not self.error_message:
                 raise ValueError("失败任务必须包含错误信息")
+
+            if self.pending_confirmation is not None:
+                raise ValueError("失败任务不能保留待确认操作")
+
+        if self.task.status is TaskStatus.BLOCKED:
+            if self.answer is not None:
+                raise ValueError("受阻任务不能包含回答")
+
+            if not isinstance(self.error_message, str) or not self.error_message:
+                raise ValueError("受阻任务必须包含说明")
+
+            if self.pending_confirmation is None:
+                raise ValueError("受阻任务必须包含待确认操作")
 
 
 class ToolAgent:
@@ -112,6 +143,7 @@ class ToolAgent:
         prompt_builder: PromptBuilder | None = None,
         history_summarizer: HistorySummarizer | None = None,
         memory_store: SQLiteMemoryStore | None = None,
+        confirmation_manager: ConfirmationManager | None = None,
     ) -> None:
         """保存模型、工具注册表和每次任务允许的最大工具轮数。"""
         if not isinstance(registry, ToolRegistry):
@@ -136,6 +168,14 @@ class ToolAgent:
         ):
             raise ValueError("memory_store 必须是 SQLiteMemoryStore 或 None")
 
+        if confirmation_manager is not None and not isinstance(
+            confirmation_manager,
+            ConfirmationManager,
+        ):
+            raise ValueError(
+                "confirmation_manager 必须是 ConfirmationManager 或 None"
+            )
+
         self._model = model
         self._registry = registry
         self._max_tool_rounds = max_tool_rounds
@@ -146,6 +186,7 @@ class ToolAgent:
         self._prompt_builder = prompt_builder or PromptBuilder()
         self._history_summarizer = history_summarizer
         self._memory_store = memory_store
+        self._confirmation_manager = confirmation_manager or ConfirmationManager()
 
     def _long_term_memory_contents(self) -> tuple[str, ...]:
         """读取少量已授权记忆，供本轮可信上下文注入。"""
@@ -199,6 +240,85 @@ class ToolAgent:
             round_summaries=tuple(round_summaries),
         )
 
+    def _blocked_turn(
+        self,
+        task: TaskState,
+        tool_results: list[ToolResult],
+        round_summaries: list[ToolRoundSummary],
+        pending_confirmation: PendingConfirmation,
+    ) -> ToolAgentTurn:
+        """将等待用户确认的调用保存为可恢复的受阻任务。"""
+        task.status = TaskStatus.BLOCKED
+        return ToolAgentTurn(
+            task=task,
+            answer=None,
+            error_message=(
+                f"工具调用等待确认: {pending_confirmation.tool_call.tool_name}"
+            ),
+            tool_results=tuple(tool_results),
+            round_summaries=tuple(round_summaries),
+            pending_confirmation=pending_confirmation,
+        )
+
+    def _requires_confirmation_for_call(self, call: ToolCall) -> bool:
+        """只为已登记的高风险工具签发确认，未知工具仍交给注册表拒绝。"""
+        try:
+            definition = self._registry.get(call.tool_name)
+        except ToolRegistryError:
+            return False
+
+        return requires_confirmation(definition.risk_level)
+
+    def _confirm_pending_call(
+        self,
+        session: Session,
+        task: TaskState,
+        confirmation_token: str,
+    ) -> ToolAgentTurn:
+        """消费确认令牌并执行其保存的原始工具调用，不请求模型。"""
+        tool_results: list[ToolResult] = []
+        round_summaries: list[ToolRoundSummary] = []
+
+        try:
+            pending = self._confirmation_manager.consume_for_session(
+                confirmation_token,
+                session.session_id,
+            )
+        except ConfirmationPolicyError as error:
+            return self._failed_turn(
+                task,
+                tool_results,
+                round_summaries,
+                str(error),
+            )
+
+        task.tool_rounds = 1
+        result = self._registry.execute(pending.tool_call)
+        tool_results.append(result)
+        round_summaries.append(
+            ToolRoundSummary(round_number=task.tool_rounds, results=(result,))
+        )
+        session.messages.append(Message.from_tool_result(result))
+
+        if result.is_error:
+            return self._failed_turn(
+                task,
+                tool_results,
+                round_summaries,
+                f"确认后工具执行失败: {result.content}",
+            )
+
+        answer = f"已确认并执行工具: {result.tool_name}\n{result.content}"
+        session.messages.append(Message(role=MessageRole.ASSISTANT, content=answer))
+        task.status = TaskStatus.COMPLETED
+        return ToolAgentTurn(
+            task=task,
+            answer=answer,
+            error_message=None,
+            tool_results=tuple(tool_results),
+            round_summaries=tuple(round_summaries),
+        )
+
     def run_turn(
         self,
         session: Session,
@@ -225,6 +345,25 @@ class ToolAgent:
 
         # 用户真实输入先写入会话；之后即使模型失败也不丢失。
         session.messages.append(user_message)
+
+        try:
+            confirmation_token = parse_confirmation_command(
+                user_message.content,
+            )
+        except ConfirmationPolicyError as error:
+            return self._failed_turn(
+                task,
+                tool_results,
+                round_summaries,
+                str(error),
+            )
+
+        if confirmation_token is not None:
+            return self._confirm_pending_call(
+                session,
+                task,
+                confirmation_token,
+            )
 
         try:
             selected_skill = (
@@ -366,6 +505,44 @@ class ToolAgent:
                             f"{call.tool_name}"
                         ),
                         is_error=True,
+                    )
+                elif self._requires_confirmation_for_call(call):
+                    try:
+                        pending = self._confirmation_manager.issue(
+                            session.session_id,
+                            call,
+                        )
+                    except ConfirmationPolicyError as error:
+                        return self._failed_turn(
+                            task,
+                            tool_results,
+                            round_summaries,
+                            str(error),
+                        )
+
+                    result = ToolResult(
+                        call_id=call.call_id,
+                        tool_name=call.tool_name,
+                        content=(
+                            f"工具调用等待确认: {call.tool_name}。"
+                            f"请发送 /confirm {pending.token} 后执行。"
+                        ),
+                        is_error=True,
+                    )
+                    tool_results.append(result)
+                    current_round_results.append(result)
+                    session.messages.append(Message.from_tool_result(result))
+                    round_summaries.append(
+                        ToolRoundSummary(
+                            round_number=task.tool_rounds,
+                            results=tuple(current_round_results),
+                        )
+                    )
+                    return self._blocked_turn(
+                        task,
+                        tool_results,
+                        round_summaries,
+                        pending,
                     )
                 else:
                     result = self._registry.execute(call)

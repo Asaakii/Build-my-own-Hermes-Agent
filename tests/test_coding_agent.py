@@ -93,10 +93,10 @@ def make_agent(
     return CodingAgent(tool_agent)
 
 
-def test_coding_agent_repairs_sample_then_passes_tests(
+def test_coding_agent_blocks_write_until_user_confirmation(
     workspace: Workspace,
 ) -> None:
-    """离线闭环应读取、精确修改、运行测试并生成完成报告。"""
+    """写入型编码任务应先受阻，等待用户确认后才允许继续。"""
     (workspace.root / "calculator.py").write_text(
         "def add(left: int, right: int) -> int:\n"
         "    return left - right\n",
@@ -148,16 +148,15 @@ def test_coding_agent_repairs_sample_then_passes_tests(
         task_id="coding-task-1",
     )
 
-    assert report.status is TaskStatus.COMPLETED
-    assert report.verification is VerificationStatus.PASSED
-    assert report.summary == "已修复加法实现，测试通过。"
-    assert [summary.round_number for summary in report.rounds] == [1, 2, 3]
+    assert report.status is TaskStatus.BLOCKED
+    assert report.verification is VerificationStatus.NOT_RUN
+    assert "等待确认: replace_text_once" in report.summary
+    assert [summary.round_number for summary in report.rounds] == [1, 2]
     assert [summary.results[0].tool_name for summary in report.rounds] == [
         "read_file",
         "replace_text_once",
-        "run_pytest",
     ]
-    assert "return left + right" in (workspace.root / "calculator.py").read_text(
+    assert "return left - right" in (workspace.root / "calculator.py").read_text(
         encoding="utf-8",
     )
     assert outside_file.read_text(encoding="utf-8") == "不能被修改"
@@ -186,10 +185,10 @@ def test_coding_agent_blocks_completion_without_test_verification(
     assert report.verification is VerificationStatus.NOT_RUN
 
 
-def test_coding_agent_marks_failed_pytest_as_failed_task(
+def test_coding_agent_blocks_test_execution_until_user_confirmation(
     workspace: Workspace,
 ) -> None:
-    """实际测试失败时，最终报告不能被模型文本掩盖。"""
+    """受控测试仍属于执行风险，确认前不能产生测试结果。"""
     tests_directory = workspace.root / "tests"
     tests_directory.mkdir()
     (tests_directory / "test_failure.py").write_text(
@@ -217,8 +216,9 @@ def test_coding_agent_marks_failed_pytest_as_failed_task(
         "运行测试。",
     )
 
-    assert report.status is TaskStatus.FAILED
-    assert report.verification is VerificationStatus.FAILED
+    assert report.status is TaskStatus.BLOCKED
+    assert report.verification is VerificationStatus.NOT_RUN
+    assert "等待确认: run_pytest" in report.summary
 
 
 def test_coding_agent_blocks_when_model_fails_before_testing(

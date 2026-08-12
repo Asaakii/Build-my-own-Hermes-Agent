@@ -49,6 +49,19 @@ def requires_confirmation(risk_level: object) -> bool:
     return risk_level is not ToolRiskLevel.READ_ONLY
 
 
+def parse_confirmation_command(content: object) -> str | None:
+    """解析严格的 /confirm 令牌命令，其他普通文本返回 None。"""
+    normalized_content = _require_text(content, "content")
+    command_name, *rest = normalized_content.split(maxsplit=1)
+    if command_name != "/confirm":
+        return None
+
+    if len(rest) != 1:
+        raise ConfirmationPolicyError("确认命令格式应为：/confirm <token>")
+
+    return _require_text(rest[0], "token")
+
+
 @dataclass(frozen=True, slots=True)
 class PendingConfirmation:
     """一项绑定会话与完整工具调用的一次性待确认记录。"""
@@ -129,6 +142,20 @@ class ConfirmationManager:
         )
         self._pending_by_token[token] = pending
         return pending
+
+    def consume_for_session(
+        self,
+        token: object,
+        session_id: object,
+    ) -> PendingConfirmation:
+        """消费令牌并返回其原始调用，不接受调用方重新提供参数。"""
+        normalized_token = _require_text(token, "token")
+        try:
+            pending = self._pending_by_token[normalized_token]
+        except KeyError as error:
+            raise ConfirmationPolicyError("确认令牌不存在或已使用") from error
+
+        return self.consume(normalized_token, session_id, pending.tool_call)
 
     def consume(
         self,
