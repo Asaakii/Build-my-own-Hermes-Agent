@@ -22,6 +22,7 @@ from hermes_lite.config import (
     format_config_summary,
     load_model_config,
 )
+from hermes_lite.doctor import DoctorReport, format_doctor_report, run_doctor
 from hermes_lite.domain import TaskStatus
 from hermes_lite.memory_store import (
     LongTermMemory,
@@ -86,6 +87,16 @@ def build_parser() -> CliArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("config", help="检查并显示脱敏模型配置。")
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="检查本地配置、状态库和工作区。",
+    )
+    doctor_parser.add_argument(
+        "--check-model",
+        action="store_true",
+        help="显式发送最小模型请求以检查连通性。",
+    )
 
     chat_parser = subparsers.add_parser(
         "chat",
@@ -274,6 +285,13 @@ def run_interactive_chat(
         _print_chat_turn(result, interactive=True)
 
 
+def _run_doctor(check_model: bool) -> int:
+    """运行本地诊断；是否请求模型由显式参数决定。"""
+    report = run_doctor(check_model=check_model)
+    print(format_doctor_report(report))
+    return 0 if report.is_healthy else 1
+
+
 def _run_config() -> int:
     """检查模型配置并显示脱敏摘要。"""
     print(format_config_summary(load_model_config()))
@@ -350,6 +368,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if arguments.command == "config":
             return _run_config()
+        if arguments.command == "doctor":
+            return _run_doctor(arguments.check_model)
         if arguments.command == "chat":
             return _run_chat(
                 arguments.session_id,

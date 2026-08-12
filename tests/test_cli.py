@@ -10,6 +10,7 @@ import pytest
 import hermes_lite.cli as cli_module
 from hermes_lite.chat_runtime import ChatTurnResult
 from hermes_lite.config import ModelConfig
+from hermes_lite.doctor import DoctorCheck, DoctorCheckStatus, DoctorReport
 from hermes_lite.confirmation_policy import PendingConfirmation
 from hermes_lite.coding_task import ToolRoundSummary
 from hermes_lite.domain import (
@@ -56,7 +57,6 @@ class MemoryStoreStub:
         """返回预设检索结果。"""
         del query, max_results
         return self.memories
-
 
 
 @dataclass
@@ -158,6 +158,7 @@ def test_help_lists_available_read_only_commands(
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "config" in captured.out
+    assert "doctor" in captured.out
     assert "chat" in captured.out
     assert "sessions" in captured.out
     assert "memory" in captured.out
@@ -387,3 +388,59 @@ def test_interactive_chat_forwards_remember_command_to_agent(
     assert "本地命令" in captured.out
     assert "Agent: 聊天已写入。" in captured.out
     assert runtime.calls == [("chat-1", "/remember 偏好简洁回答", None)]
+
+
+def make_doctor_report(*, healthy: bool) -> DoctorReport:
+    """构造供 CLI 路由测试使用的固定诊断报告。"""
+    status = DoctorCheckStatus.PASSED if healthy else DoctorCheckStatus.FAILED
+    return DoctorReport(
+        (
+            DoctorCheck(
+                name="模型配置",
+                status=status,
+                message="测试诊断结果。",
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize("check_model", [False, True])
+def test_doctor_command_forwards_explicit_model_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    check_model: bool,
+) -> None:
+    """doctor 子命令只将显式模型检查意图转交给诊断层。"""
+    requested: list[bool] = []
+
+    def fake_run_doctor(*, check_model: bool) -> DoctorReport:
+        requested.append(check_model)
+        return make_doctor_report(healthy=True)
+
+    monkeypatch.setattr(cli_module, "run_doctor", fake_run_doctor)
+    command = ["doctor"] + (["--check-model"] if check_model else [])
+
+    exit_code = cli_module.main(command)
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert requested == [check_model]
+    assert "HermesLite 本地诊断" in captured.out
+
+
+def test_doctor_command_returns_one_for_failed_check(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """诊断失败必须有非零退出码，便于脚本识别。"""
+    monkeypatch.setattr(
+        cli_module,
+        "run_doctor",
+        lambda check_model: make_doctor_report(healthy=False),
+    )
+
+    exit_code = cli_module.main(["doctor"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "[失败]" in captured.out

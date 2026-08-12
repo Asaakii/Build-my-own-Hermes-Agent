@@ -354,6 +354,36 @@ class SQLiteStateStore:
             if connection is not None:
                 connection.close()
 
+    def read_schema_version(self) -> int:
+        """只读检查已存在数据库的模式版本，不创建文件或执行迁移。"""
+        if not self.database_path.is_file():
+            raise SQLiteStateStoreError("状态数据库尚未初始化")
+
+        connection: sqlite3.Connection | None = None
+
+        try:
+            connection = sqlite3.connect(
+                f"{self.database_path.as_uri()}?mode=ro",
+                uri=True,
+            )
+            row = connection.execute(
+                "SELECT value FROM schema_metadata WHERE key = ?",
+                ("schema_version",),
+            ).fetchone()
+        except sqlite3.Error as error:
+            raise SQLiteStateStoreError("无法只读检查状态数据库") from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+        if row is None:
+            raise SQLiteStateStoreError("状态数据库缺少模式版本")
+
+        try:
+            return int(row[0])
+        except (TypeError, ValueError) as error:
+            raise SQLiteStateStoreError("状态数据库模式版本无效") from error
+
     def schema_version(self) -> int:
         """读取已初始化数据库的模式版本。"""
         self.initialize()

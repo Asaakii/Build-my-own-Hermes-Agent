@@ -153,3 +153,27 @@ def test_initialize_upgrades_previous_schema_version(project_root: Path) -> None
 
     assert table_row == ("long_term_memories",)
     assert audit_table_row == ("audit_events",)
+
+
+def test_read_schema_version_does_not_initialize_missing_database(
+    project_root: Path,
+) -> None:
+    """只读诊断不能因为检查版本而创建状态数据库。"""
+    del project_root
+    store = SQLiteStateStore(load_sqlite_state_config({}))
+
+    with pytest.raises(SQLiteStateStoreError, match="尚未初始化"):
+        store.read_schema_version()
+
+    assert not store.database_path.exists()
+
+
+def test_read_schema_version_reads_existing_database_without_migration(
+    project_root: Path,
+) -> None:
+    """已初始化数据库可被只读检查，不改变其模式版本。"""
+    del project_root
+    store = SQLiteStateStore(load_sqlite_state_config({}))
+    store.initialize()
+
+    assert store.read_schema_version() == SCHEMA_VERSION
