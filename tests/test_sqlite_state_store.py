@@ -87,6 +87,7 @@ def test_initialize_creates_all_state_tables(project_root: Path) -> None:
         "tool_results",
         "task_reports",
         "long_term_memories",
+        "audit_events",
     }.issubset(table_names)
 
 
@@ -143,7 +144,12 @@ def test_initialize_upgrades_previous_schema_version(project_root: Path) -> None
             "SELECT name FROM sqlite_master WHERE type = ? AND name = ?",
             ("table", "long_term_memories"),
         ).fetchone()
+        audit_table_row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = ? AND name = ?",
+            ("table", "audit_events"),
+        ).fetchone()
     finally:
         connection.close()
 
     assert table_row == ("long_term_memories",)
+    assert audit_table_row == ("audit_events",)

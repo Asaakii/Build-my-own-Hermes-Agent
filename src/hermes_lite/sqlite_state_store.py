@@ -12,6 +12,7 @@ import sqlite3
 
 from dotenv import load_dotenv
 
+from hermes_lite.audit_log import AuditEvent, AuditEventType
 from hermes_lite.coding_task import (
     CodingTaskReport,
     ToolRoundSummary,
@@ -30,7 +31,7 @@ from hermes_lite.domain import (
 
 
 DEFAULT_STATE_DB_RELATIVE_PATH = Path("data") / "hermes_lite.sqlite3"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SQLiteStateStoreError(ValueError):
@@ -200,6 +201,21 @@ CREATE TABLE IF NOT EXISTS task_reports (
     created_at TEXT NOT NULL,
     FOREIGN KEY (task_id) REFERENCES tasks(task_id)
 );
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    tool_name TEXT,
+    call_id TEXT,
+    argument_summary_json TEXT NOT NULL,
+    reason_code TEXT
+);
+
+CREATE INDEX IF NOT EXISTS audit_events_session_event_idx
+ON audit_events (session_id, event_id);
 """
 
 
@@ -362,6 +378,106 @@ class SQLiteStateStore:
             return int(row[0])
         except (TypeError, ValueError) as error:
             raise SQLiteStateStoreError("状态数据库模式版本无效") from error
+
+    def record_audit_event(self, event: AuditEvent) -> None:
+        """持久化一条已脱敏审计事件，不保存原始工具参数和输出。"""
+        if not isinstance(event, AuditEvent):
+            raise SQLiteStateStoreError("event 必须是 AuditEvent")
+
+        try:
+            argument_summary_json = json.dumps(
+                list(event.argument_summary),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError) as error:
+            raise SQLiteStateStoreError("审计参数摘要无法序列化") from error
+
+        self.initialize()
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = self._connect()
+            with connection:
+                connection.execute(
+                    "INSERT INTO audit_events "
+                    "(created_at, session_id, task_id, event_type, tool_name, "
+                    "call_id, argument_summary_json, reason_code) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        event.created_at.isoformat(),
+                        event.session_id,
+                        event.task_id,
+                        event.event_type.value,
+                        event.tool_name,
+                        event.call_id,
+                        argument_summary_json,
+                        event.reason_code,
+                    ),
+                )
+        except sqlite3.Error as error:
+            raise SQLiteStateStoreError("无法保存审计事件") from error
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def list_audit_events(
+        self,
+        session_id: object,
+        max_results: int = 50,
+    ) -> tuple[AuditEvent, ...]:
+        """按会话读取有限的最小化审计事件，最早事件排在前面。"""
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise SQLiteStateStoreError("session_id 必须是非空文本")
+        if (
+            isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or max_results <= 0
+        ):
+            raise SQLiteStateStoreError("max_results 必须是正整数")
+
+        self.initialize()
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = self._connect()
+            rows = connection.execute(
+                "SELECT created_at, session_id, task_id, event_type, tool_name, "
+                "call_id, argument_summary_json, reason_code "
+                "FROM audit_events WHERE session_id = ? "
+                "ORDER BY event_id ASC LIMIT ?",
+                (session_id.strip(), max_results),
+            ).fetchall()
+
+            events: list[AuditEvent] = []
+            for row in rows:
+                try:
+                    raw_summary = json.loads(row[6])
+                    if not isinstance(raw_summary, list):
+                        raise ValueError
+                    argument_summary = tuple(
+                        tuple(item)
+                        for item in raw_summary
+                    )
+                    events.append(
+                        AuditEvent(
+                            session_id=row[1],
+                            task_id=row[2],
+                            event_type=AuditEventType(row[3]),
+                            tool_name=row[4],
+                            call_id=row[5],
+                            argument_summary=argument_summary,
+                            reason_code=row[7],
+                            created_at=datetime.fromisoformat(row[0]),
+                        )
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise SQLiteStateStoreError("审计事件记录损坏") from error
+
+            return tuple(events)
+        except sqlite3.Error as error:
+            raise SQLiteStateStoreError("无法读取审计事件") from error
+        finally:
+            if connection is not None:
+                connection.close()
 
     def save_session(self, session: Session) -> None:
         """覆盖保存一条会话的完整、有序消息历史。"""

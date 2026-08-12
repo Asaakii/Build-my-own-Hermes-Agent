@@ -7,6 +7,12 @@ from dataclasses import dataclass
 from typing import Protocol
 from uuid import uuid4
 
+from hermes_lite.audit_log import (
+    AuditEvent,
+    AuditEventRecorder,
+    AuditEventType,
+    InMemoryAuditLog,
+)
 from hermes_lite.coding_task import ToolRoundSummary
 from hermes_lite.confirmation_policy import (
     ConfirmationManager,
@@ -144,6 +150,7 @@ class ToolAgent:
         history_summarizer: HistorySummarizer | None = None,
         memory_store: SQLiteMemoryStore | None = None,
         confirmation_manager: ConfirmationManager | None = None,
+        audit_recorder: AuditEventRecorder | None = None,
     ) -> None:
         """保存模型、工具注册表和每次任务允许的最大工具轮数。"""
         if not isinstance(registry, ToolRegistry):
@@ -176,6 +183,12 @@ class ToolAgent:
                 "confirmation_manager 必须是 ConfirmationManager 或 None"
             )
 
+        if audit_recorder is not None and not isinstance(
+            audit_recorder,
+            AuditEventRecorder,
+        ):
+            raise ValueError("audit_recorder 必须实现 AuditEventRecorder")
+
         self._model = model
         self._registry = registry
         self._max_tool_rounds = max_tool_rounds
@@ -187,6 +200,74 @@ class ToolAgent:
         self._history_summarizer = history_summarizer
         self._memory_store = memory_store
         self._confirmation_manager = confirmation_manager or ConfirmationManager()
+        self._audit_recorder = audit_recorder or InMemoryAuditLog()
+
+    def _record_tool_event(
+        self,
+        task: TaskState,
+        event_type: AuditEventType,
+        tool_call: ToolCall,
+        reason_code: str | None = None,
+    ) -> str | None:
+        """写入一条脱敏工具事件；失败时阻止后续敏感操作。"""
+        try:
+            self._audit_recorder.record_audit_event(
+                AuditEvent.for_tool_call(
+                    session_id=task.session_id,
+                    task_id=task.task_id,
+                    event_type=event_type,
+                    tool_call=tool_call,
+                    reason_code=reason_code,
+                )
+            )
+        except Exception:
+            return "审计事件记录失败，已停止工具操作"
+
+        return None
+
+    def _record_execution_outcome(
+        self,
+        task: TaskState,
+        tool_call: ToolCall,
+        result: ToolResult,
+    ) -> str | None:
+        """按标准结果文本区分注册表拒绝、工具失败和成功执行。"""
+        if result.content.startswith("工具调用被拒绝:"):
+            event_type = AuditEventType.TOOL_REJECTED
+            reason_code = "rejected_by_registry"
+        elif result.is_error:
+            event_type = AuditEventType.TOOL_EXECUTED
+            reason_code = "tool_error"
+        else:
+            event_type = AuditEventType.TOOL_EXECUTED
+            reason_code = "success"
+
+        return self._record_tool_event(
+            task,
+            event_type,
+            tool_call,
+            reason_code,
+        )
+
+    def _record_confirmation_rejection(
+        self,
+        task: TaskState,
+        reason_code: str,
+    ) -> str | None:
+        """记录确认被拒绝的事实，不保存用户提交的令牌。"""
+        try:
+            self._audit_recorder.record_audit_event(
+                AuditEvent(
+                    session_id=task.session_id,
+                    task_id=task.task_id,
+                    event_type=AuditEventType.CONFIRMATION_REJECTED,
+                    reason_code=reason_code,
+                )
+            )
+        except Exception:
+            return "审计事件记录失败，已停止工具操作"
+
+        return None
 
     def _long_term_memory_contents(self) -> tuple[str, ...]:
         """读取少量已授权记忆，供本轮可信上下文注入。"""
@@ -275,7 +356,7 @@ class ToolAgent:
         task: TaskState,
         confirmation_token: str,
     ) -> ToolAgentTurn:
-        """消费确认令牌并执行其保存的原始工具调用，不请求模型。"""
+        """消费确认令牌并执行其保存的原始调用，不请求模型。"""
         tool_results: list[ToolResult] = []
         round_summaries: list[ToolRoundSummary] = []
 
@@ -285,11 +366,29 @@ class ToolAgent:
                 session.session_id,
             )
         except ConfirmationPolicyError as error:
+            audit_error = self._record_confirmation_rejection(
+                task,
+                "invalid_or_unusable_token",
+            )
             return self._failed_turn(
                 task,
                 tool_results,
                 round_summaries,
-                str(error),
+                audit_error or str(error),
+            )
+
+        audit_error = self._record_tool_event(
+            task,
+            AuditEventType.CONFIRMATION_ACCEPTED,
+            pending.tool_call,
+            "user_confirmed",
+        )
+        if audit_error is not None:
+            return self._failed_turn(
+                task,
+                tool_results,
+                round_summaries,
+                audit_error,
             )
 
         task.tool_rounds = 1
@@ -299,6 +398,19 @@ class ToolAgent:
             ToolRoundSummary(round_number=task.tool_rounds, results=(result,))
         )
         session.messages.append(Message.from_tool_result(result))
+
+        audit_error = self._record_execution_outcome(
+            task,
+            pending.tool_call,
+            result,
+        )
+        if audit_error is not None:
+            return self._failed_turn(
+                task,
+                tool_results,
+                round_summaries,
+                audit_error,
+            )
 
         if result.is_error:
             return self._failed_turn(
@@ -351,11 +463,15 @@ class ToolAgent:
                 user_message.content,
             )
         except ConfirmationPolicyError as error:
+            audit_error = self._record_confirmation_rejection(
+                task,
+                "malformed_command",
+            )
             return self._failed_turn(
                 task,
                 tool_results,
                 round_summaries,
-                str(error),
+                audit_error or str(error),
             )
 
         if confirmation_token is not None:
@@ -492,6 +608,19 @@ class ToolAgent:
             current_round_results: list[ToolResult] = []
 
             for call in response.tool_calls:
+                audit_error = self._record_tool_event(
+                    task,
+                    AuditEventType.TOOL_REQUESTED,
+                    call,
+                )
+                if audit_error is not None:
+                    return self._failed_turn(
+                        task,
+                        tool_results,
+                        round_summaries,
+                        audit_error,
+                    )
+
                 if (
                     selected_skill is not None
                     and call.tool_name not in selected_skill.allowed_tools
@@ -506,6 +635,19 @@ class ToolAgent:
                         ),
                         is_error=True,
                     )
+                    audit_error = self._record_tool_event(
+                        task,
+                        AuditEventType.TOOL_REJECTED,
+                        call,
+                        "not_allowed_by_skill",
+                    )
+                    if audit_error is not None:
+                        return self._failed_turn(
+                            task,
+                            tool_results,
+                            round_summaries,
+                            audit_error,
+                        )
                 elif self._requires_confirmation_for_call(call):
                     try:
                         pending = self._confirmation_manager.issue(
@@ -518,6 +660,20 @@ class ToolAgent:
                             tool_results,
                             round_summaries,
                             str(error),
+                        )
+
+                    audit_error = self._record_tool_event(
+                        task,
+                        AuditEventType.CONFIRMATION_REQUIRED,
+                        call,
+                        "high_risk",
+                    )
+                    if audit_error is not None:
+                        return self._failed_turn(
+                            task,
+                            tool_results,
+                            round_summaries,
+                            audit_error,
                         )
 
                     result = ToolResult(
@@ -546,6 +702,28 @@ class ToolAgent:
                     )
                 else:
                     result = self._registry.execute(call)
+                    audit_error = self._record_execution_outcome(
+                        task,
+                        call,
+                        result,
+                    )
+                    if audit_error is not None:
+                        tool_results.append(result)
+                        current_round_results.append(result)
+                        session.messages.append(Message.from_tool_result(result))
+                        round_summaries.append(
+                            ToolRoundSummary(
+                                round_number=task.tool_rounds,
+                                results=tuple(current_round_results),
+                            )
+                        )
+                        return self._failed_turn(
+                            task,
+                            tool_results,
+                            round_summaries,
+                            audit_error,
+                        )
+
                 tool_results.append(result)
                 current_round_results.append(result)
                 session.messages.append(Message.from_tool_result(result))
