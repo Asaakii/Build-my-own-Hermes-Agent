@@ -183,6 +183,54 @@ Agent 只能访问项目根目录下 `AGENT_WORKSPACE_PATH` 指向的目录。�
 - 模型可能提出错误补丁、错误计划或不完整解释；确认和测试只能减少风险，不能保证正确性。
 - 基础敏感信息过滤不是完整的数据防泄漏系统。
 
+## 与官方 Hermes 的差异
+
+HermesLite 是一个面向学习的独立实现，不是官方 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) 的分支、替代品或兼容实现。两者的差别首先来自目标不同：本项目用较小、可测试的 Python 代码说明 Agent 的模型调用、工具循环、状态持久化与权限边界；官方 Hermes 是面向实际使用的完整 Agent 平台。
+
+| 方面 | HermesLite | 官方 Hermes |
+| --- | --- | --- |
+| 定位 | 单机学习与个人实验工具 | 可长期使用、持续演进的完整 Agent 平台 |
+| 模型与渠道 | OpenAI 兼容模型接口、CLI、简化本机 Gateway 与 Telegram 私聊 | 多模型供应商，以及 CLI/TUI、Telegram、Discord、Slack、WhatsApp、Signal 等渠道 |
+| 工具体系 | 受限工作区中的读、写、检索、精确替换与 Pytest | 大规模工具集、工具集管理、MCP 与多种终端后端 |
+| 学习与记忆 | 显式技能加载、SQLite 记忆、待审批复盘候选 | 跨会话搜索、用户模型、自动创建和改进技能等闭环能力 |
+| 调度与并发 | 本地延时提醒与人工审批记忆候选 | 面向渠道的 cron 自动化、子 Agent 与并行工作流 |
+| 安全与可靠性 | 路径限制、参数校验、一次性本地确认、审计 | 更完整的命令审批、配对、隔离后端、安装升级与多平台运行支持 |
+
+因此，HermesLite 的价值不在于复刻功能数量，而在于保留一条可读、可改、可测试的核心链路：模型提出动作，Agent Loop 编排，工具执行层验证，副作用经过确认和审计，状态写入 SQLite。官方 Hermes 已覆盖更广的产品能力；本项目没有实现其多渠道生态、完整 MCP、TUI、自动技能改进、子 Agent、远程运行后端或生产级隔离。
+
+## 与 MyClaw（此前 OpenClaw 学习项目）的差异
+
+两个项目都具备模型、会话、长期记忆、工具、Skills、SQLite、Gateway 和 Telegram 的学习版本，但架构重心不同。
+
+| 方面 | MyClaw / OpenClaw 学习项目 | HermesLite |
+| --- | --- | --- |
+| 核心目标 | 个人聊天 Agent 与消息渠道服务 | 可控的工具型、编码任务 Agent |
+| Gateway 地位 | 常驻 Gateway 是唯一协调者；CLI 与 Telegram 都只请求 Gateway | Gateway 是可选入口；CLI、Gateway、Telegram 与调度器复用核心运行时，但不要求所有功能都经过同一常驻服务 |
+| 内置工具 | 时间、计算、天气、受限笔记、记忆与技能 | 受限工作区的读取、检索、创建、精确修改与运行测试 |
+| 主要安全问题 | 渠道白名单、Gateway Token、工具白名单、提醒投递与记忆授权 | 文件写入、代码修改与测试执行必须经过同一交互进程内的一次性确认 |
+| 定时能力 | Gateway 管理可恢复的 Telegram 提醒与投递状态 | 本地计划任务生成提醒和待审批记忆候选，不自动写入长期记忆 |
+| 适合继续学习的方向 | 渠道适配、常驻服务、消息路由与个人助手产品化 | 工具调用、工作区边界、确认机制、测试反馈循环与编码 Agent |
+
+实际调用拓扑也不同：
+
+```text
+MyClaw：
+CLI / Telegram 适配器
+        ↓
+常驻 Gateway（唯一协调者）
+        ↓
+Agent、工具策略、SQLite、提醒服务
+
+HermesLite：
+CLI / Gateway / Telegram / Scheduler
+        ↓
+共享的 Agent Runtime
+        ↓
+模型、工具注册表、SQLite、受限工作区
+```
+
+这不是高低之分，而是职责取舍。MyClaw 更接近“消息平台上的个人助手服务”；HermesLite 更接近“在受控工作区内完成读代码、修改、测试与恢复的 Agent 实验室”。两者共同构成了从聊天型 Agent 到工具型 Agent 的两种典型架构。
+
 ## 测试与开发
 
 ```bash
