@@ -12,6 +12,9 @@ dependencies = [
     "python-dotenv==1.2.2",
 ]
 
+[project.scripts]
+hermeslite = "hermes_lite.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest==9.1.1",

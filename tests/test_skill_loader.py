@@ -173,3 +173,30 @@ def test_skill_rejects_unregistered_tool_declaration(skills_root: Path) -> None:
 
     with pytest.raises(SkillPolicyError, match="未登记工具"):
         skill.allowed_tool_definitions(registry)
+
+
+
+def test_list_available_skills_loads_directories_in_name_order(
+    skills_root: Path,
+) -> None:
+    """技能列表应复用严格加载逻辑，并按目录名称稳定排序。"""
+    write_skill(
+        skills_root,
+        "zeta_skill",
+        metadata=(
+            "{\"name\":\"zeta_skill\",\"description\":\"Z 技能。\","
+            "\"allowed_tools\":[]}"
+        ),
+    )
+    write_skill(
+        skills_root,
+        "alpha_skill",
+        metadata=(
+            "{\"name\":\"alpha_skill\",\"description\":\"A 技能。\","
+            "\"allowed_tools\":[]}"
+        ),
+    )
+
+    skills = skill_loader_module.list_available_skills()
+
+    assert [skill.name for skill in skills] == ["alpha_skill", "zeta_skill"]

@@ -195,3 +195,28 @@ def load_skill(value: object) -> Skill:
         allowed_tools=allowed_tools,
         instructions=instructions,
     )
+
+
+
+def list_available_skills() -> tuple[Skill, ...]:
+    """加载项目技能目录中的全部直接子目录技能，供只读 CLI 展示。"""
+    skills_root = (PROJECT_ROOT / SKILLS_DIRECTORY_NAME).resolve()
+
+    if not skills_root.exists():
+        return ()
+
+    if not skills_root.is_dir():
+        raise SkillLoadError("skills 路径不是目录")
+
+    skills: list[Skill] = []
+    try:
+        directories = sorted(
+            path for path in skills_root.iterdir() if path.is_dir()
+        )
+    except OSError as error:
+        raise SkillLoadError("无法列出技能目录") from error
+
+    for directory in directories:
+        skills.append(load_skill(directory.name))
+
+    return tuple(skills)
